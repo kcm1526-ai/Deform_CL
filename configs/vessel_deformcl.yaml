@@ -37,7 +37,7 @@ INPUT:
   CROP_SIZE_TRAIN: (128, 128, 128)  # Adjust based on your GPU memory
 
 SOLVER:
-  IMS_PER_BATCH: 2  # Adjust based on your GPU memory
+  IMS_PER_BATCH: 4  # Must be divisible by number of GPUs (e.g., 4 for 4 GPUs)
   BASE_LR: 1e-3
   WEIGHT_DECAY: 1e-3
   WARMUP_ITERS: 250
