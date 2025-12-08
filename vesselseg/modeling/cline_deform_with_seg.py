@@ -424,24 +424,7 @@ class Cline_Deformer(nn.Module):
         return loss_sdf
 
 
-def build_tree(pts, n_p=300, thres=0.12, use_as_loss=False):
-    # Handle empty or very small point sets
-    if pts is None or len(pts) == 0:
-        # Return a straight line template as fallback
-        z_vals = np.linspace(-0.8, 0.8, n_p)
-        fallback_pts = np.stack([np.zeros(n_p), np.zeros(n_p), z_vals], axis=1)
-        return fallback_pts, []
-
-    if len(pts) < 3:
-        # Not enough points to build a tree, interpolate to n_p points
-        if len(pts) == 1:
-            fallback_pts = np.tile(pts[0], (n_p, 1))
-        else:
-            # Linear interpolation between 2 points
-            t = np.linspace(0, 1, n_p).reshape(-1, 1)
-            fallback_pts = pts[0] * (1 - t) + pts[1] * t
-        return fallback_pts, []
-
+def build_tree(pts, n_p=300,use_as_loss=False, thres=0.12):
     G = nx.Graph()
     arr1, arr2 = pts.reshape((-1, 1, 3)), pts.reshape((1, -1, 3))
     dist_1 = np.sqrt(((arr1 - arr2)**2).sum(axis=-1))
