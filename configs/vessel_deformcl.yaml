@@ -1,0 +1,60 @@
+# Configuration for Vessel Segmentation using DeformCL
+# Dataset: M3DVBAV_CropLung (CT/MRI lung vessel images)
+
+MODEL:
+  META_ARCHITECTURE: "ClineDeformModel"
+  OUT_CHANNELS: (24,)
+  OUT_TASKS: ["features"]
+  TASK: ['cline', 'seg']
+  PRED_CLASS: 1  # Vessel class (can be adjusted based on your label values)
+  BACKBONE:
+    NAME: "build_unetaf_backbone"
+  UNETENCODER:
+    BASE_CHANNELS: 16
+    NUM_LAYERS: 4
+    NORM: 'SyncBN'
+  DEFORM:
+    NUM_STEPS: 4
+    NORM: 'SyncBN'
+    LOSS_EDGE_WEIGHT: 1
+    SDF_LOSS_WEIGHT: 1
+    CHAMFER_LOSS_WEIGHT: 1
+    ADPTPL: True
+    LOWER_THRES: 30
+    PTS_NUM: 350
+    USE_LOCAL_CHAMFER: True
+
+DATASETS:
+  TRAIN: ("VesselSeg",)
+  TEST: ("VesselSeg",)
+  NUM_FOLDS: 5
+  TEST_FOLDS: (0,)
+
+DATALOADER:
+  NUM_WORKERS: 4
+
+INPUT:
+  CROP_SIZE_TRAIN: (128, 128, 128)  # Adjust based on your GPU memory
+
+SOLVER:
+  IMS_PER_BATCH: 2  # Adjust based on your GPU memory
+  BASE_LR: 1e-3
+  WEIGHT_DECAY: 1e-3
+  WARMUP_ITERS: 250
+  WARMUP_FACTOR: 0.3
+  LR_SCHEDULER_NAME: "WarmupCosineLR"
+  MAX_ITER: 10000  # Adjust based on your dataset size
+  CHECKPOINT_PERIOD: 1000
+  CLIP_GRADIENTS:
+    ENABLED: True
+    CLIP_TYPE: "full_model"
+    CLIP_VALUE: 0.01
+    NORM_TYPE: 2.0
+  BACKBONE_MULTIPLIER: 1.0
+
+TEST:
+  EVAL_PERIOD: 1000
+
+OUTPUT_DIR: "./outputs/vessel_deformcl"
+
+CUDNN_BENCHMARK: False
