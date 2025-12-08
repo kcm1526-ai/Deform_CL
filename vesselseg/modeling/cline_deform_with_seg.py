@@ -320,20 +320,28 @@ class Cline_Deformer(nn.Module):
     def loss(self, gt_verts, preds, seg_targets, img_shape):
         losses = dict()
 
-        # Handle empty ground truth centerline
-        if gt_verts is None or len(gt_verts) == 0:
-            logger.warning("Empty ground truth centerline, using fallback loss")
-            # Return zero losses for centerline-related terms
-            losses['loss_chamfer'] = torch.tensor(0.0, device=self.device)
-            losses['loss_local_chamfer'] = torch.tensor(0.0, device=self.device)
-            losses['loss_edge'] = torch.tensor(0.0, device=self.device)
-            losses['loss_sdf'] = torch.tensor(0.0, device=self.device)
-            return losses
+        # Handle empty ground truth centerline - use fallback instead of early return
+        # to avoid deadlock in distributed training (all GPUs must follow same code path)
+        use_fallback = (gt_verts is None or len(gt_verts) == 0)
+        if use_fallback:
+            logger.warning("Empty ground truth centerline, using fallback (losses will be zeroed)")
+            # Create fallback centerline - a straight line in normalized coords
+            n_fallback = 100
+            z_vals = torch.linspace(-0.8, 0.8, n_fallback, device=self.device)
+            gt_verts = torch.stack([
+                torch.zeros(n_fallback, device=self.device),
+                torch.zeros(n_fallback, device=self.device),
+                z_vals
+            ], dim=1)
+        else:
+            gt_verts = normalize_vertices(gt_verts, img_shape).to(self.device)
 
-        gt_verts = normalize_vertices(gt_verts, img_shape).to(self.device)
         n_p = np.random.randint(60, 80)
         gt_verts_sample, _ = build_tree(gt_verts.cpu().numpy(), n_p=n_p, use_as_loss=True)
         gt_verts_sample = torch.tensor(gt_verts_sample, dtype=torch.float32, device=self.device)
+
+        # Loss multiplier: 0 for fallback samples to not affect training
+        loss_multiplier = 0.0 if use_fallback else 1.0
         
         weights = [0, .05, .6, .95, 1.0]
 
@@ -377,11 +385,11 @@ class Cline_Deformer(nn.Module):
                 loss_edge += ((v0 - v1).norm(dim=1, p=2) - target_length) ** 2.0
             loss_edge = loss_edge / len(pred_edges)
 
-            losses['loss_local_chamfer_' + str(i)] = loss_local_chamfer * 30. * weights[i] * self.chamfer_weight
+            losses['loss_local_chamfer_' + str(i)] = loss_local_chamfer * 30. * weights[i] * self.chamfer_weight * loss_multiplier
             losses['loss_edge_' + str(i)] = loss_edge * 30. * 2 * weights[i] * \
-                self.loss_edge_weight
+                self.loss_edge_weight * loss_multiplier
             loss_sdf = self.sdf_loss(pred_verts, seg_targets[0][0], img_shape) * self.sdf_loss_weight
-            losses['loss_sdf_' + str(i)] = loss_sdf * 0.5 * weights[i]
+            losses['loss_sdf_' + str(i)] = loss_sdf * 0.5 * weights[i] * loss_multiplier
 
         
         return losses
