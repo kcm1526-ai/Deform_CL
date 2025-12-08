@@ -35,3 +35,15 @@ MetadataCatalog.get('HANS40').set(
     data_dir='./HaN-Seg',
 )
 
+
+# Register Vessel Segmentation Dataset
+DatasetCatalog.register(
+    'VesselSeg',
+    lambda data_dir='./VesselSeg_Data':
+    load_npz_cta_dataset(data_dir)
+)
+
+MetadataCatalog.get('VesselSeg').set(
+    data_dir='./VesselSeg_Data',
+)
+

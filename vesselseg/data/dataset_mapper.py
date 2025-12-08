@@ -223,3 +223,98 @@ class RandomSwapAxesXZ(Augmentation):
         else:
             axes = [0, 2, 1]
         return SwapAxesTransform(axes)
+
+
+class VesselClineDeformDatasetMapper:
+    """
+    Dataset mapper for vessel segmentation using DeformCL.
+    This mapper doesn't require pre-computed bounding boxes for inference.
+    Suitable for general vessel segmentation tasks.
+    """
+
+    def __init__(self, cfg, transform_builder, is_train=True):
+        self.cfg = cfg
+        self.is_train = is_train
+        augmentations = transform_builder(cfg, is_train)
+        self.augmentations = AugmentationList(augmentations)
+        mode = "training" if is_train else "inference"
+        logger.info(f"[VesselDatasetMapper] Augmentations used in {mode}: {augmentations}")
+        self.class_id = cfg.MODEL.PRED_CLASS
+        self.pad = np.array([20, 20, 20])  # Padding around vessel region
+
+    def __call__(self, dataset_dict):
+        dataset_dict = copy.deepcopy(dataset_dict)
+        npz_file = np.load(dataset_dict["file_name"], allow_pickle=True)
+
+        # Load image and normalize
+        image = npz_file["img"].astype(np.float32)
+        image = image / 1024.0  # Normalize intensity
+
+        # Load segmentation
+        seg = npz_file["seg"].copy()
+
+        # Load centerline
+        cline = npz_file["cline"].copy()
+
+        src_shape = np.array(image.shape)
+
+        # Find ROI based on segmentation mask
+        if self.class_id > 0:
+            # Extract region for specific class
+            seg_mask = (seg == self.class_id)
+            cline_mask = (cline == self.class_id)
+        else:
+            # Use all non-zero regions
+            seg_mask = (seg > 0)
+            cline_mask = (cline > 0)
+
+        if seg_mask.any():
+            indices = np.array(np.where(seg_mask))
+            start = np.maximum(indices.min(1) - self.pad, 0)
+            end = np.minimum(indices.max(1) + 1 + self.pad, src_shape)
+        else:
+            # If no segmentation found, use full volume
+            start = np.array([0, 0, 0])
+            end = src_shape
+
+        # Crop to ROI
+        image = image[start[0]:end[0], start[1]:end[1], start[2]:end[2]]
+        seg = seg[start[0]:end[0], start[1]:end[1], start[2]:end[2]]
+        cline = cline[start[0]:end[0], start[1]:end[1], start[2]:end[2]]
+
+        # Filter to single class if specified
+        if self.class_id > 0:
+            seg[seg != self.class_id] = 0
+            cline[cline != self.class_id] = 0
+
+        # Apply augmentations
+        aug_input = AugInput(image=image, sem_seg=seg)
+        transforms = self.augmentations(aug_input)
+        image = aug_input.image
+
+        # Store in dataset dict
+        dataset_dict["image"] = torch.as_tensor(np.ascontiguousarray(image[None, ...]))
+
+        cline = transforms.apply_image(cline)
+        dataset_dict["cline"] = torch.as_tensor(np.ascontiguousarray(cline[None, ...]))
+
+        seg = transforms.apply_image(seg)
+        dataset_dict["seg"] = torch.as_tensor(np.ascontiguousarray(seg[None, ...]))
+
+        return dataset_dict
+
+
+def build_vessel_transform_gen(cfg, is_train):
+    """Build transform generators for vessel segmentation."""
+    tfm_gens = []
+    crop_size = cfg.INPUT.CROP_SIZE_TRAIN
+    if is_train:
+        tfm_gens.append(RandomCrop("absolute", crop_size))
+        tfm_gens.append(RandomCrop("relative_range", (0.9, 0.9, 0.9)))
+        tfm_gens.append(RandomFlip_Z(prob=0.5))
+        tfm_gens.append(RandomFlip_X(prob=0.5))
+        tfm_gens.append(RandomSwapAxesXZ())
+    else:
+        # For inference, optionally apply center crop or use full volume
+        pass
+    return tfm_gens
