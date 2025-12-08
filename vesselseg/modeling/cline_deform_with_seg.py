@@ -319,6 +319,17 @@ class Cline_Deformer(nn.Module):
 
     def loss(self, gt_verts, preds, seg_targets, img_shape):
         losses = dict()
+
+        # Handle empty ground truth centerline
+        if gt_verts is None or len(gt_verts) == 0:
+            logger.warning("Empty ground truth centerline, using fallback loss")
+            # Return zero losses for centerline-related terms
+            losses['loss_chamfer'] = torch.tensor(0.0, device=self.device)
+            losses['loss_local_chamfer'] = torch.tensor(0.0, device=self.device)
+            losses['loss_edge'] = torch.tensor(0.0, device=self.device)
+            losses['loss_sdf'] = torch.tensor(0.0, device=self.device)
+            return losses
+
         gt_verts = normalize_vertices(gt_verts, img_shape).to(self.device)
         n_p = np.random.randint(60, 80)
         gt_verts_sample, _ = build_tree(gt_verts.cpu().numpy(), n_p=n_p, use_as_loss=True)
@@ -413,7 +424,24 @@ class Cline_Deformer(nn.Module):
         return loss_sdf
 
 
-def build_tree(pts, n_p=300, thres=0.12):
+def build_tree(pts, n_p=300, thres=0.12, use_as_loss=False):
+    # Handle empty or very small point sets
+    if pts is None or len(pts) == 0:
+        # Return a straight line template as fallback
+        z_vals = np.linspace(-0.8, 0.8, n_p)
+        fallback_pts = np.stack([np.zeros(n_p), np.zeros(n_p), z_vals], axis=1)
+        return fallback_pts, []
+
+    if len(pts) < 3:
+        # Not enough points to build a tree, interpolate to n_p points
+        if len(pts) == 1:
+            fallback_pts = np.tile(pts[0], (n_p, 1))
+        else:
+            # Linear interpolation between 2 points
+            t = np.linspace(0, 1, n_p).reshape(-1, 1)
+            fallback_pts = pts[0] * (1 - t) + pts[1] * t
+        return fallback_pts, []
+
     G = nx.Graph()
     arr1, arr2 = pts.reshape((-1, 1, 3)), pts.reshape((1, -1, 3))
     dist_1 = np.sqrt(((arr1 - arr2)**2).sum(axis=-1))
@@ -424,6 +452,13 @@ def build_tree(pts, n_p=300, thres=0.12):
     if len(length_connected_components) > 1:
         max_cc = max(nx.connected_components(tree), key=len)
         tree = tree.subgraph(max_cc)
+
+    # Check if tree has nodes
+    if len(tree.nodes) == 0:
+        # Fallback: return uniformly sampled points from input
+        indices = np.linspace(0, len(pts) - 1, min(n_p, len(pts))).astype(int)
+        return pts[indices], []
+
     path_dict = nx.shortest_path_length(tree, list(tree.nodes)[0])
     sorted_paths = [(-v, k) for k, v in path_dict.items()]
     sorted_paths.sort()
