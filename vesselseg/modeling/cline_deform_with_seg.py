@@ -413,7 +413,7 @@ class Cline_Deformer(nn.Module):
         return loss_sdf
 
 
-def build_tree(pts, n_p=300, thres=0.12):
+def build_tree(pts, n_p=300,use_as_loss=False, thres=0.12):
     G = nx.Graph()
     arr1, arr2 = pts.reshape((-1, 1, 3)), pts.reshape((1, -1, 3))
     dist_1 = np.sqrt(((arr1 - arr2)**2).sum(axis=-1))
