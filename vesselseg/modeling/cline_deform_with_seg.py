@@ -319,6 +319,17 @@ class Cline_Deformer(nn.Module):
 
     def loss(self, gt_verts, preds, seg_targets, img_shape):
         losses = dict()
+
+        # Handle empty ground truth centerline
+        if gt_verts is None or len(gt_verts) == 0:
+            logger.warning("Empty ground truth centerline, using fallback loss")
+            # Return zero losses for centerline-related terms
+            losses['loss_chamfer'] = torch.tensor(0.0, device=self.device)
+            losses['loss_local_chamfer'] = torch.tensor(0.0, device=self.device)
+            losses['loss_edge'] = torch.tensor(0.0, device=self.device)
+            losses['loss_sdf'] = torch.tensor(0.0, device=self.device)
+            return losses
+
         gt_verts = normalize_vertices(gt_verts, img_shape).to(self.device)
         n_p = np.random.randint(60, 80)
         gt_verts_sample, _ = build_tree(gt_verts.cpu().numpy(), n_p=n_p, use_as_loss=True)
@@ -424,6 +435,13 @@ def build_tree(pts, n_p=300,use_as_loss=False, thres=0.12):
     if len(length_connected_components) > 1:
         max_cc = max(nx.connected_components(tree), key=len)
         tree = tree.subgraph(max_cc)
+
+    # Check if tree has nodes
+    if len(tree.nodes) == 0:
+        # Fallback: return uniformly sampled points from input
+        indices = np.linspace(0, len(pts) - 1, min(n_p, len(pts))).astype(int)
+        return pts[indices], []
+
     path_dict = nx.shortest_path_length(tree, list(tree.nodes)[0])
     sorted_paths = [(-v, k) for k, v in path_dict.items()]
     sorted_paths.sort()
