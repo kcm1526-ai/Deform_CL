@@ -74,7 +74,7 @@ from train_utils import (
 class DiceAccuracyHook(HookBase):
     """
     Hook to compute and log dice accuracy during training.
-    Computes dice on the training batch every N iterations.
+    Estimates dice from the dice loss logged during training.
     """
 
     def __init__(self, log_period=100):
@@ -84,28 +84,43 @@ class DiceAccuracyHook(HookBase):
         """
         self.log_period = log_period
         self._logger = logging.getLogger(__name__)
+        self._dice_scores = []
 
     def after_step(self):
         """Called after each training step."""
-        # Only compute dice periodically to avoid slowdown
+        # Only log periodically to avoid slowdown
         if (self.trainer.iter + 1) % self.log_period != 0:
             return
 
-        # Get the last batch outputs from trainer storage
-        # The model's forward pass during training returns losses, but we need predictions
-        # We'll compute dice from the storage if available
         storage = get_event_storage()
 
-        # Check if we have dice-related metrics in storage
-        # The model may already compute dice loss, which we can use as proxy
         try:
-            # Try to get dice-related loss if available
-            if hasattr(self.trainer, '_last_dice_score'):
-                dice = self.trainer._last_dice_score
-                storage.put_scalar("train_dice", dice)
+            # Try to get dice from loss values in storage
+            # The model logs loss_dice or loss_seg which we can use to estimate dice
+            history = storage.histories()
+
+            dice_score = None
+
+            # Check for loss_dice (dice loss = 1 - dice, so dice = 1 - loss)
+            if 'loss_dice' in history:
+                loss_dice = history['loss_dice'].latest()
+                dice_score = 1.0 - loss_dice
+            # Check for loss_seg as fallback
+            elif 'loss_seg' in history:
+                loss_seg = history['loss_seg'].latest()
+                dice_score = max(0.0, 1.0 - loss_seg)
+
+            if dice_score is not None:
+                self._dice_scores.append(dice_score)
+                avg_dice = np.mean(self._dice_scores[-10:]) if len(self._dice_scores) > 0 else dice_score
+
+                storage.put_scalar("train_dice", dice_score)
                 if comm.is_main_process():
-                    self._logger.info(f"[Iter {self.trainer.iter + 1}] Train Dice: {dice:.4f}")
-        except Exception:
+                    self._logger.info(
+                        f"[Iter {self.trainer.iter + 1}] Train Dice: {dice_score:.4f} (avg: {avg_dice:.4f})"
+                    )
+        except Exception as e:
+            # Silently ignore errors in dice computation
             pass
 
 
@@ -139,89 +154,17 @@ class VesselTrainer(DefaultTrainer):
     """
 
     def __init__(self, cfg):
-        # Initialize these BEFORE calling super().__init__() because
-        # the parent's __init__ calls build_hooks() which needs these
-        self._last_dice_score = 0.0
-        self._dice_scores = []
+        # Initialize dice log period BEFORE calling super().__init__() because
+        # the parent's __init__ calls build_hooks() which needs this
         self._dice_log_period = 100  # Log dice every N iterations
         super(VesselTrainer, self).__init__(cfg)
 
     def build_hooks(self):
         """Build training hooks including dice accuracy hook."""
         hooks = super().build_hooks()
-        # Add dice accuracy hook
+        # Add dice accuracy hook before the last hook (which is usually the checkpoint hook)
         hooks.insert(-1, DiceAccuracyHook(log_period=self._dice_log_period))
         return hooks
-
-    def run_step(self):
-        """
-        Override run_step to compute dice accuracy during training.
-        """
-        assert self.model.training, "[VesselTrainer] model was changed to eval mode!"
-        start = torch.cuda.Event(enable_timing=True)
-        end = torch.cuda.Event(enable_timing=True)
-
-        start.record()
-        data = next(self._data_loader_iter)
-        data_time = start.elapsed_time(end) / 1000.0  # seconds
-
-        # Forward pass
-        loss_dict = self.model(data)
-
-        # Compute dice score from segmentation predictions if available
-        if (self.iter + 1) % self._dice_log_period == 0:
-            try:
-                # Try to get dice from loss dict (some models return dice-related losses)
-                if 'loss_dice' in loss_dict:
-                    # Dice loss is 1 - dice, so dice = 1 - loss_dice
-                    dice = 1.0 - loss_dict['loss_dice'].item()
-                    self._last_dice_score = dice
-                    self._dice_scores.append(dice)
-                elif 'loss_seg' in loss_dict:
-                    # For seg loss, we'll estimate dice from loss
-                    # Lower loss generally means higher dice
-                    seg_loss = loss_dict['loss_seg'].item()
-                    dice = max(0.0, 1.0 - seg_loss)  # Approximate
-                    self._last_dice_score = dice
-                    self._dice_scores.append(dice)
-            except Exception:
-                pass
-
-        # Compute total loss
-        losses = sum(loss_dict.values())
-
-        # Backward pass
-        self.optimizer.zero_grad()
-        losses.backward()
-
-        # Log metrics
-        self._write_metrics(loss_dict, data_time)
-
-        # Optimizer step
-        self.optimizer.step()
-
-    def _write_metrics(self, loss_dict, data_time, prefix=""):
-        """Write metrics to storage."""
-        storage = get_event_storage()
-
-        # Write losses
-        total_loss = 0.0
-        for k, v in loss_dict.items():
-            if isinstance(v, torch.Tensor):
-                v = v.item()
-            total_loss += v
-            storage.put_scalar(f"{prefix}{k}", v)
-        storage.put_scalar(f"{prefix}total_loss", total_loss)
-        storage.put_scalar("data_time", data_time)
-
-        # Write dice if available
-        if self._last_dice_score > 0 and (self.iter + 1) % self._dice_log_period == 0:
-            storage.put_scalar("train_dice", self._last_dice_score)
-            if comm.is_main_process():
-                avg_dice = np.mean(self._dice_scores[-10:]) if len(self._dice_scores) > 0 else 0.0
-                logging.getLogger(__name__).info(
-                    f"[Iter {self.iter + 1}] Train Dice: {self._last_dice_score:.4f} (avg: {avg_dice:.4f})"
-                )
 
     @classmethod
     def build_evaluator(cls, cfg, dataset_name):
