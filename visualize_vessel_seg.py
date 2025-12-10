@@ -52,6 +52,58 @@ def load_nifti(file_path):
     return sitk.GetArrayFromImage(sitk_img)
 
 
+def resample_to_match(source, target_shape, is_label=False):
+    """
+    Resample source array to match target shape.
+
+    Args:
+        source: Source numpy array to resample
+        target_shape: Target shape (tuple)
+        is_label: If True, use nearest neighbor interpolation (for segmentation masks)
+
+    Returns:
+        Resampled array matching target_shape
+    """
+    if source.shape == target_shape:
+        return source
+
+    from scipy import ndimage
+
+    # Calculate zoom factors
+    zoom_factors = [t / s for t, s in zip(target_shape, source.shape)]
+
+    if is_label:
+        # Use nearest neighbor for labels to preserve discrete values
+        resampled = ndimage.zoom(source, zoom_factors, order=0, mode='nearest')
+    else:
+        # Use linear interpolation for images
+        resampled = ndimage.zoom(source, zoom_factors, order=1, mode='nearest')
+
+    # Ensure exact shape match (zoom can sometimes be off by 1 pixel)
+    if resampled.shape != target_shape:
+        # Crop or pad to match
+        result = np.zeros(target_shape, dtype=resampled.dtype)
+        slices_src = []
+        slices_dst = []
+        for i in range(len(target_shape)):
+            src_size = resampled.shape[i]
+            dst_size = target_shape[i]
+            if src_size >= dst_size:
+                # Crop source
+                start = (src_size - dst_size) // 2
+                slices_src.append(slice(start, start + dst_size))
+                slices_dst.append(slice(0, dst_size))
+            else:
+                # Pad destination
+                start = (dst_size - src_size) // 2
+                slices_src.append(slice(0, src_size))
+                slices_dst.append(slice(start, start + src_size))
+        result[tuple(slices_dst)] = resampled[tuple(slices_src)]
+        return result
+
+    return resampled
+
+
 def normalize_image(img, percentile_lower=1, percentile_upper=99):
     """Normalize image to 0-1 range using percentile clipping."""
     lower = np.percentile(img, percentile_lower)
@@ -620,6 +672,15 @@ def main():
         if args.seg:
             print(f"Loading segmentation: {args.seg}")
             seg = load_nifti(args.seg)
+            print(f"Segmentation shape: {seg.shape}")
+
+            # Resample segmentation if size doesn't match image
+            if seg.shape != image.shape:
+                print(f"\nWARNING: Shape mismatch! Image: {image.shape}, Seg: {seg.shape}")
+                print("Resampling segmentation to match image size...")
+                seg = resample_to_match(seg, image.shape, is_label=True)
+                print(f"Resampled segmentation shape: {seg.shape}")
+
             print_label_info(seg, "Segmentation")
 
             # Handle label filtering
@@ -634,6 +695,14 @@ def main():
         if args.prob:
             print(f"Loading probability map: {args.prob}")
             prob = load_nifti(args.prob)
+            print(f"Probability map shape: {prob.shape}")
+
+            # Resample probability map if size doesn't match image
+            if prob.shape != image.shape:
+                print(f"\nWARNING: Shape mismatch! Image: {image.shape}, Prob: {prob.shape}")
+                print("Resampling probability map to match image size...")
+                prob = resample_to_match(prob, image.shape, is_label=False)
+                print(f"Resampled probability map shape: {prob.shape}")
 
         print(f"\nImage shape: {image.shape}")
 
