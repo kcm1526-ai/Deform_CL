@@ -61,20 +61,59 @@ def normalize_image(img, percentile_lower=1, percentile_upper=99):
     return img_norm
 
 
-def create_overlay(image, mask, alpha=0.5, color=[1, 0, 0]):
-    """Create RGB overlay of mask on grayscale image."""
+def create_overlay(image, mask, alpha=0.5, color=[1, 0, 0], multi_label=True):
+    """Create RGB overlay of mask on grayscale image.
+
+    Args:
+        image: 2D image array
+        mask: 2D mask array (can have multiple label values)
+        alpha: Overlay transparency
+        color: Default color for binary mask
+        multi_label: If True, use different colors for different labels
+    """
     # Normalize image to 0-1
     img_norm = normalize_image(image)
 
     # Create RGB image from grayscale
     rgb = np.stack([img_norm, img_norm, img_norm], axis=-1)
 
-    # Create colored mask
-    mask_binary = (mask > 0).astype(float)
-    for i, c in enumerate(color):
-        rgb[..., i] = rgb[..., i] * (1 - alpha * mask_binary) + c * alpha * mask_binary
+    if multi_label and mask.max() > 1:
+        # Different colors for different labels
+        label_colors = {
+            1: [1, 0, 0],      # Red for label 1
+            2: [0, 1, 0],      # Green for label 2
+            3: [0, 0, 1],      # Blue for label 3
+            4: [1, 1, 0],      # Yellow for label 4
+            5: [1, 0, 1],      # Magenta for label 5
+            6: [0, 1, 1],      # Cyan for label 6
+        }
+
+        for label_val in np.unique(mask):
+            if label_val == 0:
+                continue
+            label_mask = (mask == label_val).astype(float)
+            lcolor = label_colors.get(int(label_val), [1, 0.5, 0])  # Default orange
+            for i, c in enumerate(lcolor):
+                rgb[..., i] = rgb[..., i] * (1 - alpha * label_mask) + c * alpha * label_mask
+    else:
+        # Single color for all non-zero values
+        mask_binary = (mask > 0).astype(float)
+        for i, c in enumerate(color):
+            rgb[..., i] = rgb[..., i] * (1 - alpha * mask_binary) + c * alpha * mask_binary
 
     return np.clip(rgb, 0, 1)
+
+
+def print_label_info(mask, name="Mask"):
+    """Print information about labels in a mask."""
+    unique_vals = np.unique(mask)
+    print(f"\n{name} label information:")
+    print(f"  Unique values: {unique_vals}")
+    for val in unique_vals:
+        if val == 0:
+            continue
+        count = np.sum(mask == val)
+        print(f"  Label {int(val)}: {count} voxels")
 
 
 def create_prob_colormap():
@@ -477,6 +516,10 @@ def main():
                        help='Visualization mode')
     parser.add_argument('--alpha', type=float, default=0.5,
                        help='Overlay transparency (0-1)')
+    parser.add_argument('--binary', action='store_true',
+                       help='Binarize segmentation (merge all labels into one)')
+    parser.add_argument('--label', type=int, default=None,
+                       help='Show only specific label value')
 
     args = parser.parse_args()
 
@@ -489,13 +532,22 @@ def main():
         if args.seg:
             print(f"Loading segmentation: {args.seg}")
             seg = load_nifti(args.seg)
+            print_label_info(seg, "Segmentation")
+
+            # Handle label filtering
+            if args.label is not None:
+                print(f"\nFiltering to show only label {args.label}")
+                seg = (seg == args.label).astype(np.uint8)
+            elif args.binary:
+                print("\nBinarizing segmentation (all labels -> 1)")
+                seg = (seg > 0).astype(np.uint8)
 
         prob = None
         if args.prob:
             print(f"Loading probability map: {args.prob}")
             prob = load_nifti(args.prob)
 
-        print(f"Image shape: {image.shape}")
+        print(f"\nImage shape: {image.shape}")
 
         if args.mode == 'interactive':
             title = os.path.basename(args.image)
