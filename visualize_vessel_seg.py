@@ -38,7 +38,7 @@ import argparse
 import numpy as np
 import SimpleITK as sitk
 import matplotlib.pyplot as plt
-from matplotlib.widgets import Slider, Button, RadioButtons
+from matplotlib.widgets import Slider, Button, RadioButtons, CheckButtons
 from matplotlib.colors import LinearSegmentedColormap
 import warnings
 warnings.filterwarnings('ignore')
@@ -61,20 +61,59 @@ def normalize_image(img, percentile_lower=1, percentile_upper=99):
     return img_norm
 
 
-def create_overlay(image, mask, alpha=0.5, color=[1, 0, 0]):
-    """Create RGB overlay of mask on grayscale image."""
+def create_overlay(image, mask, alpha=0.5, color=[1, 0, 0], multi_label=True):
+    """Create RGB overlay of mask on grayscale image.
+
+    Args:
+        image: 2D image array
+        mask: 2D mask array (can have multiple label values)
+        alpha: Overlay transparency
+        color: Default color for binary mask
+        multi_label: If True, use different colors for different labels
+    """
     # Normalize image to 0-1
     img_norm = normalize_image(image)
 
     # Create RGB image from grayscale
     rgb = np.stack([img_norm, img_norm, img_norm], axis=-1)
 
-    # Create colored mask
-    mask_binary = (mask > 0).astype(float)
-    for i, c in enumerate(color):
-        rgb[..., i] = rgb[..., i] * (1 - alpha * mask_binary) + c * alpha * mask_binary
+    if multi_label and mask.max() > 1:
+        # Different colors for different labels
+        label_colors = {
+            1: [1, 0, 0],      # Red for label 1
+            2: [0, 1, 0],      # Green for label 2
+            3: [0, 0, 1],      # Blue for label 3
+            4: [1, 1, 0],      # Yellow for label 4
+            5: [1, 0, 1],      # Magenta for label 5
+            6: [0, 1, 1],      # Cyan for label 6
+        }
+
+        for label_val in np.unique(mask):
+            if label_val == 0:
+                continue
+            label_mask = (mask == label_val).astype(float)
+            lcolor = label_colors.get(int(label_val), [1, 0.5, 0])  # Default orange
+            for i, c in enumerate(lcolor):
+                rgb[..., i] = rgb[..., i] * (1 - alpha * label_mask) + c * alpha * label_mask
+    else:
+        # Single color for all non-zero values
+        mask_binary = (mask > 0).astype(float)
+        for i, c in enumerate(color):
+            rgb[..., i] = rgb[..., i] * (1 - alpha * mask_binary) + c * alpha * mask_binary
 
     return np.clip(rgb, 0, 1)
+
+
+def print_label_info(mask, name="Mask"):
+    """Print information about labels in a mask."""
+    unique_vals = np.unique(mask)
+    print(f"\n{name} label information:")
+    print(f"  Unique values: {unique_vals}")
+    for val in unique_vals:
+        if val == 0:
+            continue
+        count = np.sum(mask == val)
+        print(f"  Label {int(val)}: {count} voxels")
 
 
 def create_prob_colormap():
@@ -86,6 +125,18 @@ def create_prob_colormap():
 
 class VesselVisualizer:
     """Interactive 3D volume visualizer for vessel segmentation."""
+
+    # Label colors for visualization
+    LABEL_COLORS = {
+        1: ([1, 0, 0], 'Label 1 (Red)'),
+        2: ([0, 1, 0], 'Label 2 (Green)'),
+        3: ([0, 0, 1], 'Label 3 (Blue)'),
+        4: ([1, 1, 0], 'Label 4 (Yellow)'),
+        5: ([1, 0, 1], 'Label 5 (Magenta)'),
+        6: ([0, 1, 1], 'Label 6 (Cyan)'),
+        7: ([1, 0.5, 0], 'Label 7 (Orange)'),
+        8: ([0.5, 0, 1], 'Label 8 (Purple)'),
+    }
 
     def __init__(self, image, seg=None, prob=None, title="Vessel Segmentation"):
         self.image = image
@@ -103,6 +154,15 @@ class VesselVisualizer:
         self.show_overlay = True
         self.show_prob = False
         self.alpha = 0.5
+
+        # Detect unique labels and initialize visibility
+        self.unique_labels = []
+        self.label_visible = {}
+        if seg is not None:
+            self.unique_labels = sorted([int(v) for v in np.unique(seg) if v > 0])
+            for label in self.unique_labels:
+                self.label_visible[label] = True
+            print(f"Detected labels: {self.unique_labels}")
 
     def get_slice(self, view, idx):
         """Get slice from volume for given view."""
@@ -129,10 +189,40 @@ class VesselVisualizer:
         else:
             return self.image.shape[2] - 1
 
+    def get_filtered_seg(self, seg_slice):
+        """Filter segmentation slice to show only visible labels."""
+        if seg_slice is None:
+            return None
+        filtered = np.zeros_like(seg_slice)
+        for label in self.unique_labels:
+            if self.label_visible.get(label, True):
+                filtered[seg_slice == label] = label
+        return filtered
+
+    def create_overlay_with_labels(self, img_slice, seg_slice):
+        """Create overlay with per-label color coding."""
+        if seg_slice is None:
+            return normalize_image(img_slice)
+
+        img_norm = normalize_image(img_slice)
+        rgb = np.stack([img_norm, img_norm, img_norm], axis=-1)
+
+        for label in self.unique_labels:
+            if not self.label_visible.get(label, True):
+                continue
+            label_mask = (seg_slice == label).astype(float)
+            if label_mask.sum() == 0:
+                continue
+            color, _ = self.LABEL_COLORS.get(label, ([1, 0.5, 0], f'Label {label}'))
+            for i, c in enumerate(color):
+                rgb[..., i] = rgb[..., i] * (1 - self.alpha * label_mask) + c * self.alpha * label_mask
+
+        return np.clip(rgb, 0, 1)
+
     def show_interactive(self):
         """Display interactive visualization with sliders."""
         fig, axes = plt.subplots(1, 3, figsize=(15, 5))
-        plt.subplots_adjust(bottom=0.25)
+        plt.subplots_adjust(bottom=0.25, right=0.85)
 
         # Initial display
         img_slice, seg_slice, prob_slice = self.get_slice(
@@ -144,9 +234,9 @@ class VesselVisualizer:
         axes[0].set_title('Original Image')
         axes[0].axis('off')
 
-        # Segmentation overlay
+        # Segmentation overlay (using per-label coloring)
         if seg_slice is not None:
-            overlay = create_overlay(img_slice, seg_slice, self.alpha)
+            overlay = self.create_overlay_with_labels(img_slice, seg_slice)
             self.im_seg = axes[1].imshow(overlay)
         else:
             self.im_seg = axes[1].imshow(img_slice, cmap='gray')
@@ -170,7 +260,7 @@ class VesselVisualizer:
         self.fig = fig
 
         # Slice slider
-        ax_slice = plt.axes([0.2, 0.1, 0.6, 0.03])
+        ax_slice = plt.axes([0.15, 0.1, 0.55, 0.03])
         self.slider_slice = Slider(
             ax_slice, 'Slice', 0, self.get_max_slice(self.current_view),
             valinit=self.slices[self.current_view], valstep=1
@@ -178,7 +268,7 @@ class VesselVisualizer:
         self.slider_slice.on_changed(self.update_slice)
 
         # Alpha slider
-        ax_alpha = plt.axes([0.2, 0.05, 0.6, 0.03])
+        ax_alpha = plt.axes([0.15, 0.05, 0.55, 0.03])
         self.slider_alpha = Slider(
             ax_alpha, 'Alpha', 0, 1, valinit=self.alpha
         )
@@ -189,9 +279,34 @@ class VesselVisualizer:
         self.radio_view = RadioButtons(ax_view, ('axial', 'coronal', 'sagittal'))
         self.radio_view.on_clicked(self.update_view)
 
+        # Label toggle checkboxes (on the right side)
+        if len(self.unique_labels) > 0:
+            # Create label names with colors
+            label_names = []
+            for label in self.unique_labels:
+                color, name = self.LABEL_COLORS.get(label, ([1, 0.5, 0], f'Label {label}'))
+                label_names.append(name)
+
+            # Calculate height based on number of labels
+            checkbox_height = min(0.05 * len(self.unique_labels), 0.4)
+            ax_labels = plt.axes([0.86, 0.5 - checkbox_height/2, 0.13, checkbox_height])
+            ax_labels.set_title('Labels', fontsize=10)
+
+            # Initial states (all visible)
+            initial_states = [self.label_visible[label] for label in self.unique_labels]
+
+            self.check_labels = CheckButtons(ax_labels, label_names, initial_states)
+
+            # Set checkbox colors to match label colors
+            for i, label in enumerate(self.unique_labels):
+                color, _ = self.LABEL_COLORS.get(label, ([1, 0.5, 0], f'Label {label}'))
+                self.check_labels.labels[i].set_color(color)
+
+            self.check_labels.on_clicked(self.toggle_label)
+
         # Info text
         self.info_text = fig.text(
-            0.5, 0.95, f'{self.title} | View: {self.current_view} | '
+            0.4, 0.95, f'{self.title} | View: {self.current_view} | '
             f'Slice: {self.slices[self.current_view]}',
             ha='center', fontsize=12
         )
@@ -218,6 +333,18 @@ class VesselVisualizer:
         self.current_view = label
         self.slider_slice.valmax = self.get_max_slice(label)
         self.slider_slice.set_val(self.slices[label])
+        self._refresh_display()
+
+    def toggle_label(self, label_name):
+        """Toggle visibility of a label."""
+        # Find which label was clicked based on the name
+        for label in self.unique_labels:
+            color, name = self.LABEL_COLORS.get(label, ([1, 0.5, 0], f'Label {label}'))
+            if name == label_name:
+                self.label_visible[label] = not self.label_visible[label]
+                status = "ON" if self.label_visible[label] else "OFF"
+                print(f"Label {label} ({name}): {status}")
+                break
         self._refresh_display()
 
     def on_scroll(self, event):
@@ -255,9 +382,9 @@ class VesselVisualizer:
         self.im_orig.set_data(img_slice)
         self.im_orig.set_clim(vmin=img_slice.min(), vmax=img_slice.max())
 
-        # Update segmentation overlay
+        # Update segmentation overlay (with label visibility filtering)
         if seg_slice is not None:
-            overlay = create_overlay(img_slice, seg_slice, self.alpha)
+            overlay = self.create_overlay_with_labels(img_slice, seg_slice)
             self.im_seg.set_data(overlay)
         else:
             self.im_seg.set_data(img_slice)
@@ -477,6 +604,10 @@ def main():
                        help='Visualization mode')
     parser.add_argument('--alpha', type=float, default=0.5,
                        help='Overlay transparency (0-1)')
+    parser.add_argument('--binary', action='store_true',
+                       help='Binarize segmentation (merge all labels into one)')
+    parser.add_argument('--label', type=int, default=None,
+                       help='Show only specific label value')
 
     args = parser.parse_args()
 
@@ -489,13 +620,22 @@ def main():
         if args.seg:
             print(f"Loading segmentation: {args.seg}")
             seg = load_nifti(args.seg)
+            print_label_info(seg, "Segmentation")
+
+            # Handle label filtering
+            if args.label is not None:
+                print(f"\nFiltering to show only label {args.label}")
+                seg = (seg == args.label).astype(np.uint8)
+            elif args.binary:
+                print("\nBinarizing segmentation (all labels -> 1)")
+                seg = (seg > 0).astype(np.uint8)
 
         prob = None
         if args.prob:
             print(f"Loading probability map: {args.prob}")
             prob = load_nifti(args.prob)
 
-        print(f"Image shape: {image.shape}")
+        print(f"\nImage shape: {image.shape}")
 
         if args.mode == 'interactive':
             title = os.path.basename(args.image)
