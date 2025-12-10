@@ -43,6 +43,15 @@ from collections import OrderedDict
 
 import torch
 import numpy as np
+
+import distutils
+try:
+    import distutils.version as _distutils_version
+    # Some setuptools shims don't set distutils.version attribute
+    if not hasattr(distutils, "version"):
+        distutils.version = _distutils_version
+except Exception:
+    pass
 import detectron2.utils.comm as comm
 from train_utils import build_adamw_optimizer, compute_dice_score
 from detectron2.checkpoint import DetectionCheckpointer
