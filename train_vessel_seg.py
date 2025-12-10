@@ -139,10 +139,12 @@ class VesselTrainer(DefaultTrainer):
     """
 
     def __init__(self, cfg):
-        super(VesselTrainer, self).__init__(cfg)
+        # Initialize these BEFORE calling super().__init__() because
+        # the parent's __init__ calls build_hooks() which needs these
         self._last_dice_score = 0.0
         self._dice_scores = []
         self._dice_log_period = 100  # Log dice every N iterations
+        super(VesselTrainer, self).__init__(cfg)
 
     def build_hooks(self):
         """Build training hooks including dice accuracy hook."""
