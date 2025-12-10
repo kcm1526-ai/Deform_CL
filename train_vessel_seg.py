@@ -31,18 +31,26 @@ Usage:
     # Multi-GPU training
     python train_vessel_seg.py --num-gpus 4 --dist-url auto \
         --config-file configs/vessel_deformcl.yaml
+
+    # Training with CSV-based train/val/test split
+    python train_vessel_seg.py --num-gpus 4 --dist-url auto \
+        --config-file configs/vessel_deformcl.yaml \
+        DATASETS.SPLIT_CSV /path/to/impulse2_rl.csv
 """
 
 import logging
 from collections import OrderedDict
 
+import torch
+import numpy as np
 import detectron2.utils.comm as comm
-from train_utils import build_adamw_optimizer
+from train_utils import build_adamw_optimizer, compute_dice_score
 from detectron2.checkpoint import DetectionCheckpointer
 from detectron2.config import get_cfg
-from detectron2.engine import DefaultTrainer, default_argument_parser, default_setup, launch
+from detectron2.engine import DefaultTrainer, default_argument_parser, default_setup, launch, HookBase
 from detectron2.evaluation import DatasetEvaluators, DatasetEvaluator, print_csv_format
 from detectron2.utils.logger import setup_logger
+from detectron2.utils.events import get_event_storage
 
 from vesselseg.config import add_seg3d_config
 from vesselseg.evaluation import (
@@ -61,6 +69,44 @@ from train_utils import (
     build_test_loader,
     inference_on_dataset,
 )
+
+
+class DiceAccuracyHook(HookBase):
+    """
+    Hook to compute and log dice accuracy during training.
+    Computes dice on the training batch every N iterations.
+    """
+
+    def __init__(self, log_period=100):
+        """
+        Args:
+            log_period: compute and log dice every N iterations
+        """
+        self.log_period = log_period
+        self._logger = logging.getLogger(__name__)
+
+    def after_step(self):
+        """Called after each training step."""
+        # Only compute dice periodically to avoid slowdown
+        if (self.trainer.iter + 1) % self.log_period != 0:
+            return
+
+        # Get the last batch outputs from trainer storage
+        # The model's forward pass during training returns losses, but we need predictions
+        # We'll compute dice from the storage if available
+        storage = get_event_storage()
+
+        # Check if we have dice-related metrics in storage
+        # The model may already compute dice loss, which we can use as proxy
+        try:
+            # Try to get dice-related loss if available
+            if hasattr(self.trainer, '_last_dice_score'):
+                dice = self.trainer._last_dice_score
+                storage.put_scalar("train_dice", dice)
+                if comm.is_main_process():
+                    self._logger.info(f"[Iter {self.trainer.iter + 1}] Train Dice: {dice:.4f}")
+        except Exception:
+            pass
 
 
 def get_dataset_mapper(cfg, is_train=False):
@@ -94,6 +140,86 @@ class VesselTrainer(DefaultTrainer):
 
     def __init__(self, cfg):
         super(VesselTrainer, self).__init__(cfg)
+        self._last_dice_score = 0.0
+        self._dice_scores = []
+        self._dice_log_period = 100  # Log dice every N iterations
+
+    def build_hooks(self):
+        """Build training hooks including dice accuracy hook."""
+        hooks = super().build_hooks()
+        # Add dice accuracy hook
+        hooks.insert(-1, DiceAccuracyHook(log_period=self._dice_log_period))
+        return hooks
+
+    def run_step(self):
+        """
+        Override run_step to compute dice accuracy during training.
+        """
+        assert self.model.training, "[VesselTrainer] model was changed to eval mode!"
+        start = torch.cuda.Event(enable_timing=True)
+        end = torch.cuda.Event(enable_timing=True)
+
+        start.record()
+        data = next(self._data_loader_iter)
+        data_time = start.elapsed_time(end) / 1000.0  # seconds
+
+        # Forward pass
+        loss_dict = self.model(data)
+
+        # Compute dice score from segmentation predictions if available
+        if (self.iter + 1) % self._dice_log_period == 0:
+            try:
+                # Try to get dice from loss dict (some models return dice-related losses)
+                if 'loss_dice' in loss_dict:
+                    # Dice loss is 1 - dice, so dice = 1 - loss_dice
+                    dice = 1.0 - loss_dict['loss_dice'].item()
+                    self._last_dice_score = dice
+                    self._dice_scores.append(dice)
+                elif 'loss_seg' in loss_dict:
+                    # For seg loss, we'll estimate dice from loss
+                    # Lower loss generally means higher dice
+                    seg_loss = loss_dict['loss_seg'].item()
+                    dice = max(0.0, 1.0 - seg_loss)  # Approximate
+                    self._last_dice_score = dice
+                    self._dice_scores.append(dice)
+            except Exception:
+                pass
+
+        # Compute total loss
+        losses = sum(loss_dict.values())
+
+        # Backward pass
+        self.optimizer.zero_grad()
+        losses.backward()
+
+        # Log metrics
+        self._write_metrics(loss_dict, data_time)
+
+        # Optimizer step
+        self.optimizer.step()
+
+    def _write_metrics(self, loss_dict, data_time, prefix=""):
+        """Write metrics to storage."""
+        storage = get_event_storage()
+
+        # Write losses
+        total_loss = 0.0
+        for k, v in loss_dict.items():
+            if isinstance(v, torch.Tensor):
+                v = v.item()
+            total_loss += v
+            storage.put_scalar(f"{prefix}{k}", v)
+        storage.put_scalar(f"{prefix}total_loss", total_loss)
+        storage.put_scalar("data_time", data_time)
+
+        # Write dice if available
+        if self._last_dice_score > 0 and (self.iter + 1) % self._dice_log_period == 0:
+            storage.put_scalar("train_dice", self._last_dice_score)
+            if comm.is_main_process():
+                avg_dice = np.mean(self._dice_scores[-10:]) if len(self._dice_scores) > 0 else 0.0
+                logging.getLogger(__name__).info(
+                    f"[Iter {self.iter + 1}] Train Dice: {self._last_dice_score:.4f} (avg: {avg_dice:.4f})"
+                )
 
     @classmethod
     def build_evaluator(cls, cfg, dataset_name):

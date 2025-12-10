@@ -10,6 +10,8 @@ from detectron2.utils.env import seed_all_rng
 import hashlib
 import datetime
 import time
+import csv
+import os
 from contextlib import contextmanager
 import torch
 from torch.cuda.amp import autocast
@@ -41,18 +43,96 @@ def split_dataset_dicts(dataset_dicts, key, num_fold, test_folds):
     test_set = [d for d in dataset_dicts if hash_idx(d[key], num_fold) in test_folds]
     return train_set, test_set
 
-def get_dataset_dicts(dataset_names, cfg, is_train=True):
+
+def load_split_csv(csv_path):
+    """
+    Load train/val/test split from CSV file.
+    CSV format: pid,subset
+    where subset is one of: train, val, test
+
+    Returns: dict mapping pid -> subset
+    """
+    split_map = {}
+    with open(csv_path, 'r') as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            pid = row['pid'].strip()
+            subset = row['subset'].strip().lower()
+            split_map[pid] = subset
+    return split_map
+
+
+def split_dataset_by_csv(dataset_dicts, csv_path, subset):
+    """
+    Split dataset dicts based on CSV file.
+
+    :param dataset_dicts: list of dataset dicts
+    :param csv_path: path to CSV file with pid,subset columns
+    :param subset: 'train', 'val', or 'test'
+    :return: filtered dataset dicts
+    """
+    logger = logging.getLogger(__name__)
+    split_map = load_split_csv(csv_path)
+
+    filtered_dicts = []
+    for d in dataset_dicts:
+        # Extract the case ID from file_id (e.g., "lung3d_01321" from path)
+        file_id = d.get("file_id", "")
+        # The file_id might be a full path or just the case name
+        case_id = os.path.basename(file_id).replace('.npz', '')
+
+        if case_id in split_map:
+            if split_map[case_id] == subset:
+                filtered_dicts.append(d)
+        else:
+            # If case_id not in CSV, try to match by prefix
+            matched = False
+            for pid, s in split_map.items():
+                if pid in case_id or case_id in pid:
+                    if s == subset:
+                        filtered_dicts.append(d)
+                    matched = True
+                    break
+            if not matched:
+                logger.warning(f"Case {case_id} not found in split CSV, skipping")
+
+    logger.info(f"CSV split: {len(filtered_dicts)} samples for {subset} set")
+    return filtered_dicts
+
+
+def get_dataset_dicts(dataset_names, cfg, is_train=True, subset=None):
+    """
+    Get dataset dicts with optional CSV-based splitting.
+
+    :param dataset_names: list of dataset names
+    :param cfg: config
+    :param is_train: if True, return train set; if False, return test/val set
+    :param subset: explicitly specify subset ('train', 'val', 'test') when using CSV split
+    """
     assert len(dataset_names)
     dataset_dicts = [DatasetCatalog.get(dataset_name) for dataset_name in dataset_names]
     for dataset_name, dicts in zip(dataset_names, dataset_dicts):
         assert len(dicts), "Dataset '{}' is empty!".format(dataset_name)
 
-    num_folds = cfg.DATASETS.NUM_FOLDS
-    test_folds = cfg.DATASETS.TEST_FOLDS
-
     dataset_dicts = list(itertools.chain.from_iterable(dataset_dicts))
-    train_dicts, test_dicts = split_dataset_dicts(dataset_dicts, "file_id", num_folds, test_folds)
-    return train_dicts if is_train else test_dicts
+
+    # Check if CSV split file is specified
+    split_csv = getattr(cfg.DATASETS, 'SPLIT_CSV', '')
+
+    if split_csv and os.path.exists(split_csv):
+        # Use CSV-based splitting
+        if subset is not None:
+            return split_dataset_by_csv(dataset_dicts, split_csv, subset)
+        else:
+            # Default behavior: train if is_train, else val
+            target_subset = 'train' if is_train else 'val'
+            return split_dataset_by_csv(dataset_dicts, split_csv, target_subset)
+    else:
+        # Fall back to hash-based k-fold splitting
+        num_folds = cfg.DATASETS.NUM_FOLDS
+        test_folds = cfg.DATASETS.TEST_FOLDS
+        train_dicts, test_dicts = split_dataset_dicts(dataset_dicts, "file_id", num_folds, test_folds)
+        return train_dicts if is_train else test_dicts
 
 
 def build_batch_data_loader(
@@ -333,5 +413,71 @@ def build_adamw_optimizer(cfg, model):
     if not cfg.SOLVER.CLIP_GRADIENTS.CLIP_TYPE == "full_model":
         optimizer = maybe_add_gradient_clipping(cfg, optimizer)
     return optimizer
+
+
+def compute_dice_score(pred, target, smooth=1e-5):
+    """
+    Compute Dice score between prediction and target.
+
+    :param pred: predicted segmentation (binary or probability)
+    :param target: ground truth segmentation (binary)
+    :param smooth: smoothing factor to avoid division by zero
+    :return: dice score
+    """
+    if isinstance(pred, torch.Tensor):
+        pred = pred.detach()
+        target = target.detach()
+
+        # Binarize prediction if needed
+        if pred.dtype == torch.float32 or pred.dtype == torch.float16:
+            pred = (pred > 0.5).float()
+
+        intersection = (pred * target).sum()
+        union = pred.sum() + target.sum()
+
+        dice = (2. * intersection + smooth) / (union + smooth)
+        return dice.item()
+    else:
+        # NumPy version
+        pred = np.asarray(pred)
+        target = np.asarray(target)
+
+        if pred.dtype == np.float32 or pred.dtype == np.float64:
+            pred = (pred > 0.5).astype(np.float32)
+
+        intersection = (pred * target).sum()
+        union = pred.sum() + target.sum()
+
+        dice = (2. * intersection + smooth) / (union + smooth)
+        return float(dice)
+
+
+def compute_batch_dice(pred_batch, target_batch, smooth=1e-5):
+    """
+    Compute mean Dice score for a batch of predictions.
+
+    :param pred_batch: batch of predicted segmentations [B, ...]
+    :param target_batch: batch of ground truth segmentations [B, ...]
+    :param smooth: smoothing factor
+    :return: mean dice score
+    """
+    if isinstance(pred_batch, torch.Tensor):
+        batch_size = pred_batch.shape[0]
+        dice_scores = []
+
+        for i in range(batch_size):
+            dice = compute_dice_score(pred_batch[i], target_batch[i], smooth)
+            dice_scores.append(dice)
+
+        return np.mean(dice_scores)
+    else:
+        batch_size = len(pred_batch)
+        dice_scores = []
+
+        for i in range(batch_size):
+            dice = compute_dice_score(pred_batch[i], target_batch[i], smooth)
+            dice_scores.append(dice)
+
+        return np.mean(dice_scores)
 
 

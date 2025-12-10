@@ -7,6 +7,9 @@ def add_seg3d_config(cfg):
     cfg.DATASETS.NUM_FOLDS = 5
     # IDs of test folds, every entry in [0, num_folds - 1]
     cfg.DATASETS.TEST_FOLDS = (0,)
+    # CSV file for train/val/test split (format: pid,subset)
+    # If specified, this overrides NUM_FOLDS and TEST_FOLDS
+    cfg.DATASETS.SPLIT_CSV = ""
 
     # categories
     cfg.MODEL.PRED_CLASS = 0
