@@ -21,6 +21,10 @@ DATASETS:
   TEST: ("VesselSeg",)
   NUM_FOLDS: 5
   TEST_FOLDS: (0,)
+  # CSV file for train/val/test split (format: pid,subset where subset is train/val/test)
+  # If specified, this overrides NUM_FOLDS and TEST_FOLDS
+  # Example: SPLIT_CSV: "/path/to/impulse2_rl.csv"
+  SPLIT_CSV: ""
 
 DATALOADER:
   NUM_WORKERS: 4
