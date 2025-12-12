@@ -1,0 +1,3 @@
+[submodule "MIAI_Inference_RUS_Kidney_Vessel_hao"]
+	path = MIAI_Inference_RUS_Kidney_Vessel_hao
+	url = https://github.com/hutom-io/MIAI_Inference_RUS_Kidney_Vessel.git
