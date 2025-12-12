@@ -1,0 +1,89 @@
+# Configuration for IMPROVED Lung Vessel Segmentation
+# Optimized for thin vessel detection with:
+# - Attention gates in skip connections
+# - SE blocks for channel attention
+# - Deep supervision
+# - clDice and topology-preserving losses
+# - Larger base channels for better feature capacity
+
+MODEL:
+  META_ARCHITECTURE: "ClineDeformModel"
+  OUT_CHANNELS: (48,)  # Increased from 24 for more capacity
+  OUT_TASKS: ["features"]
+  TASK: ['cline', 'seg']
+  PRED_CLASS: 1
+  BACKBONE:
+    NAME: "build_unet_improved_backbone"  # Use improved backbone
+  UNETENCODER:
+    BASE_CHANNELS: 32  # Increased from 16 for better thin vessel detection
+    NUM_LAYERS: 4
+    NORM: 'SyncBN'
+    # Improved architecture options
+    USE_ATTENTION_GATES: True
+    USE_SE: True
+    DEEP_SUPERVISION: True
+  DEFORM:
+    NUM_STEPS: 4
+    NORM: 'SyncBN'
+    LOSS_EDGE_WEIGHT: 0.5  # Reduced - less emphasis on edge regularity
+    SDF_LOSS_WEIGHT: 0.5   # Reduced
+    CHAMFER_LOSS_WEIGHT: 1.5  # Increased - better centerline matching
+    ADPTPL: True
+    LOWER_THRES: 20  # Lower threshold to capture thin vessels
+    PTS_NUM: 500  # More points for finer vessel representation
+    USE_LOCAL_CHAMFER: True
+  # Thin vessel loss - KEY FOR IMPROVEMENT
+  THIN_VESSEL_LOSS:
+    ENABLED: True
+    DICE_WEIGHT: 0.25
+    CLDICE_WEIGHT: 0.35  # Increased - topology preservation is crucial
+    FOCAL_WEIGHT: 0.2
+    BOUNDARY_WEIGHT: 0.1
+    MULTISCALE_WEIGHT: 0.1
+    CLDICE_ALPHA: 0.6  # More weight on centerline preservation
+    FOCAL_GAMMA: 2.5   # Focus more on hard examples
+    DEEP_SUPERVISION_WEIGHT: 0.3
+
+DATASETS:
+  TRAIN: ("VesselSeg",)
+  TEST: ("VesselSeg",)
+  NUM_FOLDS: 5
+  TEST_FOLDS: (0,)
+  SPLIT_CSV: ""
+
+DATALOADER:
+  NUM_WORKERS: 4
+
+INPUT:
+  CROP_SIZE_TRAIN: (128, 128, 128)
+  AUGMENTATION:
+    ELASTIC_DEFORM: True  # Important for vessel variability
+    ELASTIC_ALPHA: 80.0
+    ELASTIC_SIGMA: 8.0
+    INTENSITY_SHIFT: 0.15
+    INTENSITY_SCALE: 0.15
+    GAMMA_RANGE: (0.7, 1.3)
+
+SOLVER:
+  IMS_PER_BATCH: 4
+  BASE_LR: 5e-4  # Slightly lower LR for stable training
+  WEIGHT_DECAY: 1e-4  # Lower weight decay
+  WARMUP_ITERS: 500  # Warmup for stable start
+  WARMUP_FACTOR: 0.1
+  LR_SCHEDULER_NAME: "WarmupCosineLR"
+  MAX_ITER: 20000  # Longer training for better convergence
+  CHECKPOINT_PERIOD: 2000
+  CLIP_GRADIENTS:
+    ENABLED: True
+    CLIP_TYPE: "full_model"
+    CLIP_VALUE: 0.5  # More aggressive gradient clipping
+    NORM_TYPE: 2.0
+  BACKBONE_MULTIPLIER: 1.0
+  OPTIMIZER: "ADAMW"
+
+TEST:
+  EVAL_PERIOD: 2000
+
+OUTPUT_DIR: "./outputs/vessel_lung_improved"
+
+CUDNN_BENCHMARK: False

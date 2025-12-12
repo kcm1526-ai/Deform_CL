@@ -20,12 +20,22 @@ def add_seg3d_config(cfg):
     cfg.MODEL.OUT_TASKS = ["cline"]
 
     cfg.MODEL.BACKBONE.FREEZE_AT = 0
+    cfg.MODEL.BACKBONE.PRETRAINED = ""  # Path to pretrained weights (e.g., model_best.model)
+    cfg.MODEL.BACKBONE.FREEZE_BACKBONE = False  # Freeze entire encoder for transfer learning
     cfg.MODEL.LOSS = 'dice'
+
+    # MedNeXt backbone configuration
+    cfg.MODEL.MEDNEXT_SIZE = "S"  # Model size: 'S', 'B', 'M', 'L'
+    cfg.MODEL.MEDNEXT_KERNEL_SIZE = 3  # Kernel size: 3 or 5
 
     cfg.MODEL.UNETENCODER = CN()
     cfg.MODEL.UNETENCODER.BASE_CHANNELS = 16
     cfg.MODEL.UNETENCODER.NUM_LAYERS = 4
     cfg.MODEL.UNETENCODER.NORM = 'SyncBN'
+    # New options for improved backbone
+    cfg.MODEL.UNETENCODER.USE_ATTENTION_GATES = True
+    cfg.MODEL.UNETENCODER.USE_SE = True
+    cfg.MODEL.UNETENCODER.DEEP_SUPERVISION = True
 
     # config for segmentation
     cfg.MODEL.SEGMENTOR = CN()
@@ -35,7 +45,19 @@ def add_seg3d_config(cfg):
     cfg.MODEL.SEGMENTOR.AORTA = False
     cfg.MODEL.SEGMENTOR.DIST_INPUT = False
     cfg.MODEL.SEGMENTOR.LOSS = "Diceloss"
-    
+
+    # Thin vessel loss configuration
+    cfg.MODEL.THIN_VESSEL_LOSS = CN()
+    cfg.MODEL.THIN_VESSEL_LOSS.ENABLED = False
+    cfg.MODEL.THIN_VESSEL_LOSS.DICE_WEIGHT = 0.3
+    cfg.MODEL.THIN_VESSEL_LOSS.CLDICE_WEIGHT = 0.3
+    cfg.MODEL.THIN_VESSEL_LOSS.FOCAL_WEIGHT = 0.2
+    cfg.MODEL.THIN_VESSEL_LOSS.BOUNDARY_WEIGHT = 0.1
+    cfg.MODEL.THIN_VESSEL_LOSS.MULTISCALE_WEIGHT = 0.1
+    cfg.MODEL.THIN_VESSEL_LOSS.CLDICE_ALPHA = 0.5
+    cfg.MODEL.THIN_VESSEL_LOSS.FOCAL_GAMMA = 2.0
+    cfg.MODEL.THIN_VESSEL_LOSS.DEEP_SUPERVISION_WEIGHT = 0.3
+
     # deform
     cfg.MODEL.DEFORM = CN()
     cfg.MODEL.DEFORM.NUM_STEPS = 4
@@ -50,6 +72,15 @@ def add_seg3d_config(cfg):
 
     # config for input
     cfg.INPUT.CROP_SIZE_TRAIN = (128, 128, 128)
+
+    # Data augmentation for thin structures
+    cfg.INPUT.AUGMENTATION = CN()
+    cfg.INPUT.AUGMENTATION.ELASTIC_DEFORM = False
+    cfg.INPUT.AUGMENTATION.ELASTIC_ALPHA = 100.0
+    cfg.INPUT.AUGMENTATION.ELASTIC_SIGMA = 10.0
+    cfg.INPUT.AUGMENTATION.INTENSITY_SHIFT = 0.1
+    cfg.INPUT.AUGMENTATION.INTENSITY_SCALE = 0.1
+    cfg.INPUT.AUGMENTATION.GAMMA_RANGE = (0.8, 1.2)
 
     cfg.SOLVER.OPTIMIZER = "ADAMW"
     cfg.SOLVER.WARMUP_ITERS = 0

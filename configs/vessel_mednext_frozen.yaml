@@ -1,0 +1,92 @@
+# Configuration for Lung Vessel Segmentation with FROZEN MedNeXt Backbone
+# Transfer learning: Uses pretrained kidney vessel model, freezes encoder
+# Only trains decoder for lung vessel adaptation
+
+MODEL:
+  META_ARCHITECTURE: "ClineDeformModel"
+  OUT_CHANNELS: (48,)
+  OUT_TASKS: ["features"]
+  TASK: ['cline', 'seg']
+  PRED_CLASS: 1
+  BACKBONE:
+    NAME: "build_mednext_backbone"
+    FREEZE_AT: 0
+    # === SET YOUR PRETRAINED WEIGHTS PATH HERE ===
+    PRETRAINED: "/path/to/model_best.model"  # Path to pretrained model
+    FREEZE_BACKBONE: True  # Freeze encoder, only train decoder
+  # MedNeXt specific settings (must match pretrained model)
+  MEDNEXT_SIZE: "S"
+  MEDNEXT_KERNEL_SIZE: 3
+  UNETENCODER:
+    BASE_CHANNELS: 32
+    NUM_LAYERS: 4
+    NORM: 'SyncBN'
+    DEEP_SUPERVISION: True
+    USE_ATTENTION_GATES: False
+    USE_SE: False
+  DEFORM:
+    NUM_STEPS: 4
+    NORM: 'SyncBN'
+    LOSS_EDGE_WEIGHT: 0.5
+    SDF_LOSS_WEIGHT: 0.5
+    CHAMFER_LOSS_WEIGHT: 1.5
+    ADPTPL: True
+    LOWER_THRES: 20
+    PTS_NUM: 500
+    USE_LOCAL_CHAMFER: True
+  THIN_VESSEL_LOSS:
+    ENABLED: True
+    DICE_WEIGHT: 0.25
+    CLDICE_WEIGHT: 0.35
+    FOCAL_WEIGHT: 0.2
+    BOUNDARY_WEIGHT: 0.1
+    MULTISCALE_WEIGHT: 0.1
+    CLDICE_ALPHA: 0.6
+    FOCAL_GAMMA: 2.5
+    DEEP_SUPERVISION_WEIGHT: 0.3
+
+DATASETS:
+  TRAIN: ("VesselSeg",)
+  TEST: ("VesselSeg",)
+  NUM_FOLDS: 5
+  TEST_FOLDS: (0,)
+  SPLIT_CSV: ""
+
+DATALOADER:
+  NUM_WORKERS: 4
+
+INPUT:
+  CROP_SIZE_TRAIN: (128, 128, 128)
+  AUGMENTATION:
+    ELASTIC_DEFORM: True
+    ELASTIC_ALPHA: 80.0
+    ELASTIC_SIGMA: 8.0
+    INTENSITY_SHIFT: 0.15
+    INTENSITY_SCALE: 0.15
+    GAMMA_RANGE: (0.7, 1.3)
+
+SOLVER:
+  IMS_PER_BATCH: 4
+  # Higher LR since only decoder trains
+  BASE_LR: 1e-3
+  WEIGHT_DECAY: 1e-4
+  WARMUP_ITERS: 200
+  WARMUP_FACTOR: 0.1
+  LR_SCHEDULER_NAME: "WarmupCosineLR"
+  # Shorter training with frozen backbone
+  MAX_ITER: 10000
+  CHECKPOINT_PERIOD: 1000
+  CLIP_GRADIENTS:
+    ENABLED: True
+    CLIP_TYPE: "full_model"
+    CLIP_VALUE: 0.5
+    NORM_TYPE: 2.0
+  BACKBONE_MULTIPLIER: 1.0
+  OPTIMIZER: "ADAMW"
+
+TEST:
+  EVAL_PERIOD: 1000
+
+OUTPUT_DIR: "./outputs/vessel_mednext_frozen"
+
+CUDNN_BENCHMARK: False
