@@ -561,8 +561,22 @@ class MedNeXtBackbone(Backbone):
             self._out_feature_strides[name] = stride
 
         self.return_seg_logits = 'seg' in cfg.MODEL.TASK
+        self.return_inter_feats = 'cline' in cfg.MODEL.TASK
         self.deep_supervision = deep_supervision
         self.n_channels = base_channels
+
+        # Add inter_block to project feat_4x to expected channels (24 for cline_deformer)
+        # feat_4x has base_channels * 4 = 128 channels, but cline_deformer expects 24
+        if self.return_inter_feats:
+            feat_4x_channels = base_channels * 4  # 128 for base_channels=32
+            inter_channels = 24  # hardcoded in cline_deformer
+            self.inter_block = nn.Sequential(
+                nn.Conv3d(feat_4x_channels, feat_4x_channels, kernel_size=3, padding=1),
+                nn.ReLU(inplace=True),
+                nn.Conv3d(feat_4x_channels, inter_channels, kernel_size=1),
+            )
+        else:
+            self.inter_block = None
 
         # Load pretrained weights if provided
         if pretrained_path and pretrained_path.strip():
@@ -641,10 +655,13 @@ class MedNeXtBackbone(Backbone):
         d0 = self.mednext.dec_block_0(d0)
 
         # Build output dictionary
+        # Apply inter_block to feat_4x if needed for cline_deformer
+        feat_4x_out = self.inter_block(d2) if self.inter_block is not None else d2
+
         outputs = {
             'feat_16x': x_bottleneck,
             'feat_8x': d3,
-            'feat_4x': d2,
+            'feat_4x': feat_4x_out,
             'feat_2x': d1,
             'feat_1x': d0,
         }
