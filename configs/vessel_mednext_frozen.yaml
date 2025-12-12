@@ -66,7 +66,7 @@ INPUT:
     GAMMA_RANGE: (0.7, 1.3)
 
 SOLVER:
-  IMS_PER_BATCH: 4
+  IMS_PER_BATCH: 1  # Model requires batch size 1 (ClineDeformModel constraint)
   # Higher LR since only decoder trains
   BASE_LR: 1e-3
   WEIGHT_DECAY: 1e-4
