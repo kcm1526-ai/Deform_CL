@@ -1,6 +1,9 @@
 """ Transformation of image/mesh coordinates. """
 
 def normalize_vertices(vertices, shape, ori_type="absolute"):
+    # Ensure shape is on the same device as vertices
+    if hasattr(shape, 'to'):
+        shape = shape.to(vertices.device)
     if ori_type == 'absolute':
         new_verts = 2 * (vertices / (shape - 1) - 0.5)
     else:
@@ -9,6 +12,9 @@ def normalize_vertices(vertices, shape, ori_type="absolute"):
     return new_verts
 
 def unnormalize_vertices(vertices, shape, ori_type="absolute"):
+    # Ensure shape is on the same device as vertices
+    if hasattr(shape, 'to'):
+        shape = shape.to(vertices.device)
     if ori_type == 'absolute':
         new_verts = (0.5 * vertices + 0.5) * (shape - 1)
     else:
