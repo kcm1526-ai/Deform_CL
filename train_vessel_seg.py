@@ -42,6 +42,7 @@ import logging
 from collections import OrderedDict
 
 import torch
+import torch.nn as nn
 import numpy as np
 
 import distutils
@@ -57,6 +58,7 @@ from train_utils import build_adamw_optimizer, compute_dice_score
 from detectron2.checkpoint import DetectionCheckpointer
 from detectron2.config import get_cfg
 from detectron2.engine import DefaultTrainer, default_argument_parser, default_setup, launch, HookBase
+from detectron2.engine.train_loop import SimpleTrainer, AMPTrainer
 from detectron2.evaluation import DatasetEvaluators, DatasetEvaluator, print_csv_format
 from detectron2.utils.logger import setup_logger
 from detectron2.utils.events import get_event_storage
@@ -157,6 +159,27 @@ def get_dataset_mapper(cfg, is_train=False):
     return mapper_func(cfg, transform_builder, is_train)
 
 
+def create_ddp_model(model, *, fp16_compression=False, **kwargs):
+    """
+    Create a DistributedDataParallel model with find_unused_parameters=True.
+    This is needed because MedNeXt has parameters (dummy_tensor, deep supervision outputs)
+    that may not be used in every forward pass.
+    """
+    from torch.nn.parallel import DistributedDataParallel as DDP
+
+    if comm.get_world_size() == 1:
+        return model
+
+    if "device_ids" not in kwargs:
+        kwargs["device_ids"] = [comm.get_local_rank()]
+
+    # Enable find_unused_parameters to handle unused deep supervision / gradient checkpoint params
+    kwargs["find_unused_parameters"] = True
+
+    ddp = DDP(model, **kwargs)
+    return ddp
+
+
 class VesselTrainer(DefaultTrainer):
     """
     Trainer class for vessel segmentation.
@@ -166,14 +189,105 @@ class VesselTrainer(DefaultTrainer):
         # Initialize dice log period BEFORE calling super().__init__() because
         # the parent's __init__ calls build_hooks() which needs this
         self._dice_log_period = 100  # Log dice every N iterations
-        super(VesselTrainer, self).__init__(cfg)
+
+        # We need custom DDP initialization with find_unused_parameters=True
+        # This is required because MedNeXt backbone has parameters that may not be
+        # used in every forward pass (dummy_tensor, deep supervision outputs)
+        self._custom_init(cfg)
+
+    def _custom_init(self, cfg):
+        """
+        Custom initialization that mimics DefaultTrainer but uses find_unused_parameters=True
+        for DDP to handle MedNeXt's unused parameters.
+        """
+        import os
+        import weakref
+        from detectron2.solver import build_lr_scheduler
+        from detectron2.checkpoint import DetectionCheckpointer
+        from detectron2.utils.events import EventStorage
+
+        logger = logging.getLogger("detectron2")
+
+        # Initialize base class attributes (from TrainerBase)
+        self._hooks = []
+        self.iter = 0
+        self.start_iter = 0
+        self.storage = None
+
+        # Build model
+        model = self.build_model(cfg)
+        optimizer = self.build_optimizer(cfg, model)
+        data_loader = self.build_train_loader(cfg)
+
+        # Wrap model in DDP with find_unused_parameters=True
+        model = create_ddp_model(model, broadcast_buffers=False)
+
+        # Create trainer (SimpleTrainer or AMPTrainer)
+        # Note: detectron2's default uses SimpleTrainer. If AMP is needed, use AMPTrainer.
+        self._trainer = SimpleTrainer(model, data_loader, optimizer)
+
+        self.scheduler = build_lr_scheduler(cfg, optimizer)
+
+        # Ensure output directory exists
+        os.makedirs(cfg.OUTPUT_DIR, exist_ok=True)
+
+        self.checkpointer = DetectionCheckpointer(
+            model,
+            cfg.OUTPUT_DIR,
+            trainer=weakref.proxy(self),
+        )
+        self.start_iter = 0
+        self.max_iter = cfg.SOLVER.MAX_ITER
+        self.cfg = cfg
+
+        # Store model reference
+        self.model = model
+
+        self.register_hooks(self.build_hooks())
 
     def build_hooks(self):
         """Build training hooks including dice accuracy hook."""
-        hooks = super().build_hooks()
-        # Add dice accuracy hook before the last hook (which is usually the checkpoint hook)
-        hooks.insert(-1, DiceAccuracyHook(log_period=self._dice_log_period))
-        return hooks
+        from detectron2.engine import hooks as d2_hooks
+        from detectron2.utils.events import CommonMetricPrinter, JSONWriter, TensorboardXWriter
+
+        cfg = self.cfg
+        ret = [
+            d2_hooks.IterationTimer(),
+            d2_hooks.LRScheduler(),
+        ]
+
+        # Periodic checkpointing
+        if cfg.SOLVER.CHECKPOINT_PERIOD > 0:
+            ret.append(
+                d2_hooks.PeriodicCheckpointer(
+                    self.checkpointer, cfg.SOLVER.CHECKPOINT_PERIOD
+                )
+            )
+
+        # Periodic evaluation
+        if len(cfg.DATASETS.TEST) > 0 and cfg.TEST.EVAL_PERIOD > 0:
+            ret.append(
+                d2_hooks.EvalHook(
+                    cfg.TEST.EVAL_PERIOD,
+                    lambda: self.test(cfg, self.model),
+                )
+            )
+
+        # Add dice accuracy hook
+        ret.append(DiceAccuracyHook(log_period=self._dice_log_period))
+
+        # Periodic writer (should be last)
+        if comm.is_main_process():
+            ret.append(d2_hooks.PeriodicWriter(
+                [
+                    CommonMetricPrinter(self.max_iter),
+                    JSONWriter(f"{cfg.OUTPUT_DIR}/metrics.json"),
+                    TensorboardXWriter(cfg.OUTPUT_DIR),
+                ],
+                period=cfg.SOLVER.LOG_PERIOD if hasattr(cfg.SOLVER, 'LOG_PERIOD') else 20
+            ))
+
+        return ret
 
     @classmethod
     def build_evaluator(cls, cfg, dataset_name):
