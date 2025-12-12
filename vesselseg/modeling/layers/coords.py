@@ -5,8 +5,10 @@ from pytorch3d.ops import knn_points
 def get_meshgrid(shape, device):
     assert len(shape) <= 3
     ns = [torch.arange(0, s, dtype=torch.float, device=device) + 0.5 for s in shape]
-    grids = torch.meshgrid(*ns)
-    return torch.stack(grids, dim=-1)
+    grids = torch.meshgrid(*ns, indexing='ij')
+    result = torch.stack(grids, dim=-1)
+    del grids  # Free intermediate grids
+    return result
 
 def batched_dist_map(shape, points):
     """
@@ -29,7 +31,10 @@ def batched_dist_map(shape, points):
         points_tensor[b, :length_p[b]] = points[b]
 
     coords_nn = knn_points(coords, points_tensor, lengths2=length_p, K=1)
+    del coords, points_tensor  # Free intermediate tensors
+
     dist_map = coords_nn.dists.sqrt().squeeze(-1)
+    del coords_nn  # Free KNN result after extracting distances
 
     dist_map = dist_map.reshape(B, 1, *shape)
 

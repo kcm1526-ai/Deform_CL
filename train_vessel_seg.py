@@ -82,6 +82,27 @@ from train_utils import (
 )
 
 
+class MemoryCleanupHook(HookBase):
+    """
+    Hook to periodically clear CUDA cache to prevent memory fragmentation.
+    This helps prevent OOM errors during long training runs.
+    """
+
+    def __init__(self, cleanup_period=50):
+        """
+        Args:
+            cleanup_period: clear CUDA cache every N iterations
+        """
+        self.cleanup_period = cleanup_period
+        self._logger = logging.getLogger(__name__)
+
+    def after_step(self):
+        """Called after each training step."""
+        if (self.trainer.iter + 1) % self.cleanup_period == 0:
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+
 class DiceAccuracyHook(HookBase):
     """
     Hook to compute and log dice accuracy during training.
@@ -272,6 +293,9 @@ class VesselTrainer(DefaultTrainer):
                     lambda: self.test(cfg, self.model),
                 )
             )
+
+        # Add memory cleanup hook to prevent OOM from memory fragmentation
+        ret.append(MemoryCleanupHook(cleanup_period=50))
 
         # Add dice accuracy hook
         ret.append(DiceAccuracyHook(log_period=self._dice_log_period))

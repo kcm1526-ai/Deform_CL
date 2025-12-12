@@ -400,17 +400,21 @@ class Cline_Deformer(nn.Module):
         assert len(gt_seg.shape) == 3
         if gt_seg.sum() < 5:
             return pred_verts.sum() * 0.0
-        
+
         pred_verts_ori = unnormalize_vertices(pred_verts, img_shape)
+
+        # Cache img_shape on CPU to avoid repeated transfers
+        img_shape_np = img_shape.cpu().numpy() - 1
 
         sdf_signs = []
         for verts in pred_verts_ori:
             verts_ = verts.detach().cpu().numpy().astype(np.int32)
-            verts_ = verts_.clip(min=0, max=img_shape.cpu().numpy() - 1)
+            verts_ = verts_.clip(min=0, max=img_shape_np)
             sdf_signs.append(gt_seg[verts_[0], verts_[1], verts_[2]])
         sdf_signs = torch.tensor(sdf_signs, dtype=torch.float32, device=pred_verts.device)
         sdf_signs[sdf_signs==0] = -1
         sdf_signs = - sdf_signs
+        del pred_verts_ori  # Free intermediate tensor
 
         np_kernel = np.array([
                                 [[0,0,0],[0,1,0],[0,0,0]],
@@ -420,13 +424,19 @@ class Cline_Deformer(nn.Module):
 
         torch_kernel = torch.tensor(np_kernel, dtype=torch.float32, device=pred_verts.device)
         temp = F.conv3d(gt_seg[None][None], torch_kernel[None, None], padding=1)[0][0]
+        del torch_kernel  # Free kernel tensor
         gt_surface = (temp < 7) & (gt_seg > 0)
+        del temp  # Free intermediate conv result
 
         gt_pts = torch.nonzero(gt_surface > 0.).float()
+        del gt_surface  # Free surface mask
         gt_pts = normalize_vertices(gt_pts, img_shape).to(pred_verts.device)
         pred_nn = knn_points(pred_verts[None, ...], gt_pts[None, ...], K=1)
+        del gt_pts  # Free gt_pts after KNN
         pred_k1_dist = pred_nn.dists.sqrt().squeeze(0).squeeze(-1)
+        del pred_nn  # Free KNN result
         pred_sdf = pred_k1_dist * sdf_signs
+        del pred_k1_dist, sdf_signs  # Free intermediate tensors
         loss_sdf = pred_sdf.mean()
 
         return loss_sdf
