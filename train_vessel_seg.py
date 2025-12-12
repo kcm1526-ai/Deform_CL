@@ -276,12 +276,18 @@ class VesselTrainer(DefaultTrainer):
                 )
             )
 
-        # Periodic evaluation
+        # Periodic evaluation with memory cleanup
         if len(cfg.DATASETS.TEST) > 0 and cfg.TEST.EVAL_PERIOD > 0:
+            def eval_with_cleanup():
+                # Clear CUDA cache before evaluation to free training memory
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                return self.test(cfg, self.model)
+
             ret.append(
                 d2_hooks.EvalHook(
                     cfg.TEST.EVAL_PERIOD,
-                    lambda: self.test(cfg, self.model),
+                    eval_with_cleanup,
                 )
             )
 

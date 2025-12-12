@@ -283,6 +283,10 @@ def inference_on_dataset(model, data_loader, evaluator, amp=True):
         evaluator = DatasetEvaluators([])
     evaluator.reset()
 
+    # Clear CUDA cache before starting evaluation to free up memory from training
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
     num_warmup = min(5, total - 1)
     start_time = time.perf_counter()
     total_compute_time = 0
@@ -296,17 +300,18 @@ def inference_on_dataset(model, data_loader, evaluator, amp=True):
             if amp == True:
                 with autocast():
                     outputs = model(inputs)
-                    # print GPU memory usage
-                    print(f'memory: {torch.cuda.memory_allocated() / (1024)**3}')
-                    
             else:
                 outputs = model(inputs)
-                # print GPU memory usage
-                print(f'memory: {torch.cuda.memory_allocated(device=0) / (1024)**3}')
+
             if torch.cuda.is_available():
                 torch.cuda.synchronize()
             total_compute_time += time.perf_counter() - start_compute_time
             evaluator.process(inputs, outputs)
+
+            # Clean up outputs to free memory
+            del outputs
+            if torch.cuda.is_available() and idx % 10 == 0:
+                torch.cuda.empty_cache()
 
             iters_after_start = idx + 1 - num_warmup * int(idx >= num_warmup)
             seconds_per_img = total_compute_time / iters_after_start
@@ -320,6 +325,10 @@ def inference_on_dataset(model, data_loader, evaluator, amp=True):
                     ),
                     n=5,
                 )
+
+    # Final cleanup
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
     # Measure the time only for this worker (before the synchronization barrier)
     total_time = time.perf_counter() - start_time
