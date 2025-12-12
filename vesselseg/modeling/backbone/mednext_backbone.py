@@ -616,42 +616,52 @@ class MedNeXtBackbone(Backbone):
         """Forward pass returning multi-scale features."""
         # Get intermediate features manually
         x_stem = self.mednext.stem(x)
+        del x  # Free input tensor
 
         # Encoder
         x_res_0 = self.mednext.enc_block_0(x_stem)
+        del x_stem
         x_down_0 = self.mednext.down_0(x_res_0)
 
         x_res_1 = self.mednext.enc_block_1(x_down_0)
+        del x_down_0
         x_down_1 = self.mednext.down_1(x_res_1)
 
         x_res_2 = self.mednext.enc_block_2(x_down_1)
+        del x_down_1
         x_down_2 = self.mednext.down_2(x_res_2)
 
         x_res_3 = self.mednext.enc_block_3(x_down_2)
+        del x_down_2
         x_down_3 = self.mednext.down_3(x_res_3)
 
         # Bottleneck
         x_bottleneck = self.mednext.bottleneck(x_down_3)
+        del x_down_3
 
         # Decoder with skip connections (match sizes before addition)
         x_up_3 = self.mednext.up_3(x_bottleneck)
         x_up_3 = self._match_size(x_up_3, x_res_3)
         d3 = x_res_3 + x_up_3
+        del x_res_3, x_up_3
         d3 = self.mednext.dec_block_3(d3)
 
         x_up_2 = self.mednext.up_2(d3)
         x_up_2 = self._match_size(x_up_2, x_res_2)
         d2 = x_res_2 + x_up_2
+        del x_res_2, x_up_2
         d2 = self.mednext.dec_block_2(d2)
 
         x_up_1 = self.mednext.up_1(d2)
         x_up_1 = self._match_size(x_up_1, x_res_1)
         d1 = x_res_1 + x_up_1
+        del x_res_1, x_up_1
         d1 = self.mednext.dec_block_1(d1)
 
         x_up_0 = self.mednext.up_0(d1)
         x_up_0 = self._match_size(x_up_0, x_res_0)
         d0 = x_res_0 + x_up_0
+        del x_res_0, x_up_0
         d0 = self.mednext.dec_block_0(d0)
 
         # Build output dictionary
