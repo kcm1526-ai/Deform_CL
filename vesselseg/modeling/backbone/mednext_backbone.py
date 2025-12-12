@@ -1,25 +1,24 @@
 """
 MedNeXt Backbone for 3D Medical Image Segmentation
-Based on: https://github.com/MIC-DKFZ/MedNeXt (MICCAI 2023)
+Exact implementation matching: https://github.com/MIC-DKFZ/MedNeXt
 
 Supports:
-- Multiple model sizes (S, B, M, L)
-- Kernel size 3 or 5
+- Pretrained weight loading from nnUNet MedNeXt models (model_best.model)
+- Backbone freezing for transfer learning
 - Deep supervision
-- Pretrained weight loading (nnUNet format)
-- Backbone freezing
+- Gradient checkpointing
 """
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
-import pickle
+import torch.utils.checkpoint as checkpoint
+from collections import OrderedDict
 from pathlib import Path
-from typing import Optional, List, Dict, Union, Tuple
-import fvcore.nn.weight_init as weight_init
+from typing import Optional, List, Dict, Union
+import pickle
 
 from detectron2.modeling import Backbone, BACKBONE_REGISTRY
-from ..layers.conv_blocks import ShapeSpec3d
+
 from .mednext_blocks import (
     MedNeXtBlock,
     MedNeXtDownBlock,
@@ -28,46 +27,12 @@ from .mednext_blocks import (
 )
 
 
-# Model configurations: (n_channels, exp_r, block_counts)
-# exp_r can be int (same for all) or list (per-level)
-MODEL_CONFIGS = {
-    'S': {
-        'n_channels': 32,
-        'exp_r': 2,
-        'block_counts': [2, 2, 2, 2, 2, 2, 2, 2, 2],
-        'checkpoint_style': None,
-    },
-    'B': {
-        'n_channels': 32,
-        'exp_r': [2, 3, 4, 4, 4, 4, 4, 3, 2],
-        'block_counts': [2, 2, 2, 2, 2, 2, 2, 2, 2],
-        'checkpoint_style': None,
-    },
-    'M': {
-        'n_channels': 32,
-        'exp_r': [2, 3, 4, 4, 4, 4, 4, 3, 2],
-        'block_counts': [3, 4, 4, 4, 4, 4, 4, 4, 3],
-        'checkpoint_style': 'outside_block',
-    },
-    'L': {
-        'n_channels': 32,
-        'exp_r': [3, 4, 8, 8, 8, 8, 8, 4, 3],
-        'block_counts': [3, 4, 8, 8, 8, 8, 8, 4, 3],
-        'checkpoint_style': 'outside_block',
-    },
-}
-
-
 class MedNeXt(nn.Module):
     """
-    MedNeXt: A fully ConvNeXt encoder-decoder network for 3D medical image segmentation.
+    MedNeXt: A fully ConvNeXt encoder-decoder for 3D medical image segmentation.
 
-    Architecture:
-    - Encoder with 4 downsampling stages
-    - Bottleneck
-    - Decoder with 4 upsampling stages
-    - Skip connections
-    - Optional deep supervision
+    This implementation exactly matches the original MedNeXt for weight compatibility.
+    Reference: https://github.com/MIC-DKFZ/MedNeXt
     """
 
     def __init__(
@@ -75,242 +40,456 @@ class MedNeXt(nn.Module):
         in_channels: int = 1,
         n_channels: int = 32,
         n_classes: int = 1,
-        exp_r: Union[int, List[int]] = 2,
-        kernel_size: int = 3,
-        deep_supervision: bool = True,
-        do_res: bool = True,
-        do_res_up_down: bool = True,
+        exp_r: Union[int, List[int]] = 4,
+        kernel_size: int = 7,
+        enc_kernel_size: int = None,
+        dec_kernel_size: int = None,
+        deep_supervision: bool = False,
+        do_res: bool = False,
+        do_res_up_down: bool = False,
+        checkpoint_style: str = None,
         block_counts: List[int] = None,
-        norm_type: str = "group",
-        grn: bool = False,
-        dim: int = 3
+        norm_type: str = 'group',
+        dim: str = '3d',
+        grn: bool = False
     ):
         super().__init__()
+
+        self.do_ds = deep_supervision
+        assert checkpoint_style in [None, 'outside_block']
+        self.inside_block_checkpointing = False
+        self.outside_block_checkpointing = False
+        if checkpoint_style == 'outside_block':
+            self.outside_block_checkpointing = True
+
+        assert dim in ['2d', '3d']
 
         if block_counts is None:
             block_counts = [2, 2, 2, 2, 2, 2, 2, 2, 2]
 
-        self.deep_supervision = deep_supervision
-        self.n_classes = n_classes
-        self.dim = dim
+        if kernel_size is not None:
+            enc_kernel_size = kernel_size
+            dec_kernel_size = kernel_size
+
+        if dim == '2d':
+            conv = nn.Conv2d
+        else:
+            conv = nn.Conv3d
+
+        # Stem
+        self.stem = conv(in_channels, n_channels, kernel_size=1)
 
         # Handle expansion ratio (can be int or list)
         if isinstance(exp_r, int):
-            exp_r = [exp_r] * 9  # 4 encoder + 1 bottleneck + 4 decoder
+            exp_r = [exp_r for _ in range(len(block_counts))]
 
-        # Channel progression for encoder/decoder
-        # Stem -> 32, Down1 -> 64, Down2 -> 128, Down3 -> 256, Bottleneck -> 512
-        self.enc_channels = [
-            n_channels,
-            n_channels * 2,
-            n_channels * 4,
-            n_channels * 8,
-            n_channels * 16
-        ]
-        self.dec_channels = self.enc_channels[::-1]
-
-        # Stem block
-        if dim == 3:
-            conv_layer = nn.Conv3d
-        else:
-            conv_layer = nn.Conv2d
-
-        self.stem = conv_layer(
-            in_channels,
-            n_channels,
-            kernel_size=1,
-            bias=True
-        )
-
-        # Encoder stages (each has blocks + downsampling)
+        # Encoder Block 0
         self.enc_block_0 = nn.Sequential(*[
             MedNeXtBlock(
-                n_channels, n_channels,
-                exp_r=exp_r[0], kernel_size=kernel_size,
-                do_res=do_res, norm_type=norm_type, grn=grn, dim=dim
-            ) for _ in range(block_counts[0])
+                in_channels=n_channels,
+                out_channels=n_channels,
+                exp_r=exp_r[0],
+                kernel_size=enc_kernel_size,
+                do_res=do_res,
+                norm_type=norm_type,
+                dim=dim,
+                grn=grn
+            )
+            for _ in range(block_counts[0])
         ])
+
         self.down_0 = MedNeXtDownBlock(
-            n_channels, n_channels * 2,
-            exp_r=exp_r[0], kernel_size=kernel_size,
-            do_res=do_res_up_down, norm_type=norm_type, grn=grn, dim=dim
+            in_channels=n_channels,
+            out_channels=2 * n_channels,
+            exp_r=exp_r[1],
+            kernel_size=enc_kernel_size,
+            do_res=do_res_up_down,
+            norm_type=norm_type,
+            dim=dim
         )
 
+        # Encoder Block 1
         self.enc_block_1 = nn.Sequential(*[
             MedNeXtBlock(
-                n_channels * 2, n_channels * 2,
-                exp_r=exp_r[1], kernel_size=kernel_size,
-                do_res=do_res, norm_type=norm_type, grn=grn, dim=dim
-            ) for _ in range(block_counts[1])
+                in_channels=n_channels * 2,
+                out_channels=n_channels * 2,
+                exp_r=exp_r[1],
+                kernel_size=enc_kernel_size,
+                do_res=do_res,
+                norm_type=norm_type,
+                dim=dim,
+                grn=grn
+            )
+            for _ in range(block_counts[1])
         ])
+
         self.down_1 = MedNeXtDownBlock(
-            n_channels * 2, n_channels * 4,
-            exp_r=exp_r[1], kernel_size=kernel_size,
-            do_res=do_res_up_down, norm_type=norm_type, grn=grn, dim=dim
+            in_channels=2 * n_channels,
+            out_channels=4 * n_channels,
+            exp_r=exp_r[2],
+            kernel_size=enc_kernel_size,
+            do_res=do_res_up_down,
+            norm_type=norm_type,
+            dim=dim,
+            grn=grn
         )
 
+        # Encoder Block 2
         self.enc_block_2 = nn.Sequential(*[
             MedNeXtBlock(
-                n_channels * 4, n_channels * 4,
-                exp_r=exp_r[2], kernel_size=kernel_size,
-                do_res=do_res, norm_type=norm_type, grn=grn, dim=dim
-            ) for _ in range(block_counts[2])
+                in_channels=n_channels * 4,
+                out_channels=n_channels * 4,
+                exp_r=exp_r[2],
+                kernel_size=enc_kernel_size,
+                do_res=do_res,
+                norm_type=norm_type,
+                dim=dim,
+                grn=grn
+            )
+            for _ in range(block_counts[2])
         ])
+
         self.down_2 = MedNeXtDownBlock(
-            n_channels * 4, n_channels * 8,
-            exp_r=exp_r[2], kernel_size=kernel_size,
-            do_res=do_res_up_down, norm_type=norm_type, grn=grn, dim=dim
+            in_channels=4 * n_channels,
+            out_channels=8 * n_channels,
+            exp_r=exp_r[3],
+            kernel_size=enc_kernel_size,
+            do_res=do_res_up_down,
+            norm_type=norm_type,
+            dim=dim,
+            grn=grn
         )
 
+        # Encoder Block 3
         self.enc_block_3 = nn.Sequential(*[
             MedNeXtBlock(
-                n_channels * 8, n_channels * 8,
-                exp_r=exp_r[3], kernel_size=kernel_size,
-                do_res=do_res, norm_type=norm_type, grn=grn, dim=dim
-            ) for _ in range(block_counts[3])
+                in_channels=n_channels * 8,
+                out_channels=n_channels * 8,
+                exp_r=exp_r[3],
+                kernel_size=enc_kernel_size,
+                do_res=do_res,
+                norm_type=norm_type,
+                dim=dim,
+                grn=grn
+            )
+            for _ in range(block_counts[3])
         ])
+
         self.down_3 = MedNeXtDownBlock(
-            n_channels * 8, n_channels * 16,
-            exp_r=exp_r[3], kernel_size=kernel_size,
-            do_res=do_res_up_down, norm_type=norm_type, grn=grn, dim=dim
+            in_channels=8 * n_channels,
+            out_channels=16 * n_channels,
+            exp_r=exp_r[4],
+            kernel_size=enc_kernel_size,
+            do_res=do_res_up_down,
+            norm_type=norm_type,
+            dim=dim,
+            grn=grn
         )
 
         # Bottleneck
         self.bottleneck = nn.Sequential(*[
             MedNeXtBlock(
-                n_channels * 16, n_channels * 16,
-                exp_r=exp_r[4], kernel_size=kernel_size,
-                do_res=do_res, norm_type=norm_type, grn=grn, dim=dim
-            ) for _ in range(block_counts[4])
+                in_channels=n_channels * 16,
+                out_channels=n_channels * 16,
+                exp_r=exp_r[4],
+                kernel_size=dec_kernel_size,
+                do_res=do_res,
+                norm_type=norm_type,
+                dim=dim,
+                grn=grn
+            )
+            for _ in range(block_counts[4])
         ])
 
-        # Decoder stages
+        # Decoder
         self.up_3 = MedNeXtUpBlock(
-            n_channels * 16, n_channels * 8,
-            exp_r=exp_r[5], kernel_size=kernel_size,
-            do_res=do_res_up_down, norm_type=norm_type, grn=grn, dim=dim
+            in_channels=16 * n_channels,
+            out_channels=8 * n_channels,
+            exp_r=exp_r[5],
+            kernel_size=dec_kernel_size,
+            do_res=do_res_up_down,
+            norm_type=norm_type,
+            dim=dim,
+            grn=grn
         )
+
         self.dec_block_3 = nn.Sequential(*[
             MedNeXtBlock(
-                n_channels * 8, n_channels * 8,
-                exp_r=exp_r[5], kernel_size=kernel_size,
-                do_res=do_res, norm_type=norm_type, grn=grn, dim=dim
-            ) for _ in range(block_counts[5])
+                in_channels=n_channels * 8,
+                out_channels=n_channels * 8,
+                exp_r=exp_r[5],
+                kernel_size=dec_kernel_size,
+                do_res=do_res,
+                norm_type=norm_type,
+                dim=dim,
+                grn=grn
+            )
+            for _ in range(block_counts[5])
         ])
 
         self.up_2 = MedNeXtUpBlock(
-            n_channels * 8, n_channels * 4,
-            exp_r=exp_r[6], kernel_size=kernel_size,
-            do_res=do_res_up_down, norm_type=norm_type, grn=grn, dim=dim
+            in_channels=8 * n_channels,
+            out_channels=4 * n_channels,
+            exp_r=exp_r[6],
+            kernel_size=dec_kernel_size,
+            do_res=do_res_up_down,
+            norm_type=norm_type,
+            dim=dim,
+            grn=grn
         )
+
         self.dec_block_2 = nn.Sequential(*[
             MedNeXtBlock(
-                n_channels * 4, n_channels * 4,
-                exp_r=exp_r[6], kernel_size=kernel_size,
-                do_res=do_res, norm_type=norm_type, grn=grn, dim=dim
-            ) for _ in range(block_counts[6])
+                in_channels=n_channels * 4,
+                out_channels=n_channels * 4,
+                exp_r=exp_r[6],
+                kernel_size=dec_kernel_size,
+                do_res=do_res,
+                norm_type=norm_type,
+                dim=dim,
+                grn=grn
+            )
+            for _ in range(block_counts[6])
         ])
 
         self.up_1 = MedNeXtUpBlock(
-            n_channels * 4, n_channels * 2,
-            exp_r=exp_r[7], kernel_size=kernel_size,
-            do_res=do_res_up_down, norm_type=norm_type, grn=grn, dim=dim
+            in_channels=4 * n_channels,
+            out_channels=2 * n_channels,
+            exp_r=exp_r[7],
+            kernel_size=dec_kernel_size,
+            do_res=do_res_up_down,
+            norm_type=norm_type,
+            dim=dim,
+            grn=grn
         )
+
         self.dec_block_1 = nn.Sequential(*[
             MedNeXtBlock(
-                n_channels * 2, n_channels * 2,
-                exp_r=exp_r[7], kernel_size=kernel_size,
-                do_res=do_res, norm_type=norm_type, grn=grn, dim=dim
-            ) for _ in range(block_counts[7])
+                in_channels=n_channels * 2,
+                out_channels=n_channels * 2,
+                exp_r=exp_r[7],
+                kernel_size=dec_kernel_size,
+                do_res=do_res,
+                norm_type=norm_type,
+                dim=dim,
+                grn=grn
+            )
+            for _ in range(block_counts[7])
         ])
 
         self.up_0 = MedNeXtUpBlock(
-            n_channels * 2, n_channels,
-            exp_r=exp_r[8], kernel_size=kernel_size,
-            do_res=do_res_up_down, norm_type=norm_type, grn=grn, dim=dim
+            in_channels=2 * n_channels,
+            out_channels=n_channels,
+            exp_r=exp_r[8],
+            kernel_size=dec_kernel_size,
+            do_res=do_res_up_down,
+            norm_type=norm_type,
+            dim=dim,
+            grn=grn
         )
+
         self.dec_block_0 = nn.Sequential(*[
             MedNeXtBlock(
-                n_channels, n_channels,
-                exp_r=exp_r[8], kernel_size=kernel_size,
-                do_res=do_res, norm_type=norm_type, grn=grn, dim=dim
-            ) for _ in range(block_counts[8])
+                in_channels=n_channels,
+                out_channels=n_channels,
+                exp_r=exp_r[8],
+                kernel_size=dec_kernel_size,
+                do_res=do_res,
+                norm_type=norm_type,
+                dim=dim,
+                grn=grn
+            )
+            for _ in range(block_counts[8])
         ])
 
-        # Output block
-        self.out_block = OutBlock(n_channels, n_classes, dim=dim)
+        # Output blocks
+        self.out_0 = OutBlock(in_channels=n_channels, n_classes=n_classes, dim=dim)
 
-        # Deep supervision outputs (for auxiliary losses)
+        # Dummy tensor for gradient checkpointing bug workaround
+        self.dummy_tensor = nn.Parameter(torch.tensor([1.]), requires_grad=True)
+
+        # Deep supervision outputs
         if deep_supervision:
-            self.ds_out_3 = OutBlock(n_channels * 8, n_classes, dim=dim)
-            self.ds_out_2 = OutBlock(n_channels * 4, n_classes, dim=dim)
-            self.ds_out_1 = OutBlock(n_channels * 2, n_classes, dim=dim)
+            self.out_1 = OutBlock(in_channels=n_channels * 2, n_classes=n_classes, dim=dim)
+            self.out_2 = OutBlock(in_channels=n_channels * 4, n_classes=n_classes, dim=dim)
+            self.out_3 = OutBlock(in_channels=n_channels * 8, n_classes=n_classes, dim=dim)
+            self.out_4 = OutBlock(in_channels=n_channels * 16, n_classes=n_classes, dim=dim)
 
-    def forward(self, x: torch.Tensor) -> Union[torch.Tensor, Dict[str, torch.Tensor]]:
-        # Encoder
+        self.block_counts = block_counts
+
+    def iterative_checkpoint(self, sequential_block, x):
+        """Forward through sequential block with gradient checkpointing."""
+        for layer in sequential_block:
+            x = checkpoint.checkpoint(layer, x, self.dummy_tensor, use_reentrant=False)
+        return x
+
+    def forward(self, x):
         x = self.stem(x)
 
-        # Stage 0
-        x0 = self.enc_block_0(x)
-        x = self.down_0(x0)
+        if self.outside_block_checkpointing:
+            x_res_0 = self.iterative_checkpoint(self.enc_block_0, x)
+            x = checkpoint.checkpoint(self.down_0, x_res_0, self.dummy_tensor, use_reentrant=False)
+            x_res_1 = self.iterative_checkpoint(self.enc_block_1, x)
+            x = checkpoint.checkpoint(self.down_1, x_res_1, self.dummy_tensor, use_reentrant=False)
+            x_res_2 = self.iterative_checkpoint(self.enc_block_2, x)
+            x = checkpoint.checkpoint(self.down_2, x_res_2, self.dummy_tensor, use_reentrant=False)
+            x_res_3 = self.iterative_checkpoint(self.enc_block_3, x)
+            x = checkpoint.checkpoint(self.down_3, x_res_3, self.dummy_tensor, use_reentrant=False)
 
-        # Stage 1
-        x1 = self.enc_block_1(x)
-        x = self.down_1(x1)
+            x = self.iterative_checkpoint(self.bottleneck, x)
+            if self.do_ds:
+                x_ds_4 = checkpoint.checkpoint(self.out_4, x, self.dummy_tensor, use_reentrant=False)
 
-        # Stage 2
-        x2 = self.enc_block_2(x)
-        x = self.down_2(x2)
+            x_up_3 = checkpoint.checkpoint(self.up_3, x, self.dummy_tensor, use_reentrant=False)
+            dec_x = x_res_3 + x_up_3
+            x = self.iterative_checkpoint(self.dec_block_3, dec_x)
+            if self.do_ds:
+                x_ds_3 = checkpoint.checkpoint(self.out_3, x, self.dummy_tensor, use_reentrant=False)
+            del x_res_3, x_up_3
 
-        # Stage 3
-        x3 = self.enc_block_3(x)
-        x = self.down_3(x3)
+            x_up_2 = checkpoint.checkpoint(self.up_2, x, self.dummy_tensor, use_reentrant=False)
+            dec_x = x_res_2 + x_up_2
+            x = self.iterative_checkpoint(self.dec_block_2, dec_x)
+            if self.do_ds:
+                x_ds_2 = checkpoint.checkpoint(self.out_2, x, self.dummy_tensor, use_reentrant=False)
+            del x_res_2, x_up_2
 
-        # Bottleneck
-        x = self.bottleneck(x)
+            x_up_1 = checkpoint.checkpoint(self.up_1, x, self.dummy_tensor, use_reentrant=False)
+            dec_x = x_res_1 + x_up_1
+            x = self.iterative_checkpoint(self.dec_block_1, dec_x)
+            if self.do_ds:
+                x_ds_1 = checkpoint.checkpoint(self.out_1, x, self.dummy_tensor, use_reentrant=False)
+            del x_res_1, x_up_1
 
-        # Decoder with skip connections
-        x = self.up_3(x)
-        x = x + x3  # Skip connection
-        x = self.dec_block_3(x)
-        ds3 = x
+            x_up_0 = checkpoint.checkpoint(self.up_0, x, self.dummy_tensor, use_reentrant=False)
+            dec_x = x_res_0 + x_up_0
+            x = self.iterative_checkpoint(self.dec_block_0, dec_x)
+            del x_res_0, x_up_0, dec_x
 
-        x = self.up_2(x)
-        x = x + x2
-        x = self.dec_block_2(x)
-        ds2 = x
+            x = checkpoint.checkpoint(self.out_0, x, self.dummy_tensor, use_reentrant=False)
+        else:
+            # Standard forward pass
+            x_res_0 = self.enc_block_0(x)
+            x = self.down_0(x_res_0)
+            x_res_1 = self.enc_block_1(x)
+            x = self.down_1(x_res_1)
+            x_res_2 = self.enc_block_2(x)
+            x = self.down_2(x_res_2)
+            x_res_3 = self.enc_block_3(x)
+            x = self.down_3(x_res_3)
 
-        x = self.up_1(x)
-        x = x + x1
-        x = self.dec_block_1(x)
-        ds1 = x
+            x = self.bottleneck(x)
+            if self.do_ds:
+                x_ds_4 = self.out_4(x)
 
-        x = self.up_0(x)
-        x = x + x0
-        x = self.dec_block_0(x)
+            x_up_3 = self.up_3(x)
+            dec_x = x_res_3 + x_up_3
+            x = self.dec_block_3(dec_x)
+            if self.do_ds:
+                x_ds_3 = self.out_3(x)
+            del x_res_3, x_up_3
 
-        # Output
-        out = self.out_block(x)
+            x_up_2 = self.up_2(x)
+            dec_x = x_res_2 + x_up_2
+            x = self.dec_block_2(dec_x)
+            if self.do_ds:
+                x_ds_2 = self.out_2(x)
+            del x_res_2, x_up_2
 
-        if self.deep_supervision and self.training:
-            return {
-                'seg': out,
-                'ds3': self.ds_out_3(ds3),
-                'ds2': self.ds_out_2(ds2),
-                'ds1': self.ds_out_1(ds1),
-            }
+            x_up_1 = self.up_1(x)
+            dec_x = x_res_1 + x_up_1
+            x = self.dec_block_1(dec_x)
+            if self.do_ds:
+                x_ds_1 = self.out_1(x)
+            del x_res_1, x_up_1
 
-        return out
+            x_up_0 = self.up_0(x)
+            dec_x = x_res_0 + x_up_0
+            x = self.dec_block_0(dec_x)
+            del x_res_0, x_up_0, dec_x
 
-    def get_encoder_features(self) -> Dict[str, torch.Tensor]:
-        """Return intermediate encoder features for use in other heads."""
-        return self._encoder_features
+            x = self.out_0(x)
+
+        if self.do_ds:
+            return [x, x_ds_1, x_ds_2, x_ds_3, x_ds_4]
+        else:
+            return x
+
+
+def load_pretrained_mednext(
+    model: MedNeXt,
+    pretrained_path: str,
+    strict: bool = False
+) -> MedNeXt:
+    """
+    Load pretrained weights from nnUNet MedNeXt format.
+
+    Args:
+        model: MedNeXt model instance
+        pretrained_path: Path to model_best.model file
+        strict: Whether to strictly enforce key matching
+
+    Returns:
+        Model with loaded weights
+    """
+    print(f"Loading pretrained weights from: {pretrained_path}")
+
+    # Load checkpoint
+    saved_model = torch.load(pretrained_path, map_location='cpu')
+
+    # Get state dict
+    if isinstance(saved_model, dict):
+        if 'state_dict' in saved_model:
+            state_dict = saved_model['state_dict']
+        elif 'network_weights' in saved_model:
+            state_dict = saved_model['network_weights']
+        elif 'model' in saved_model:
+            state_dict = saved_model['model']
+        else:
+            state_dict = saved_model
+    else:
+        state_dict = saved_model
+
+    # Process keys (remove 'module.' prefix if present)
+    curr_state_dict_keys = list(model.state_dict().keys())
+    new_state_dict = OrderedDict()
+
+    matched = 0
+    unmatched = []
+
+    for k, value in state_dict.items():
+        key = k
+        # Remove 'module.' prefix if present (from DataParallel)
+        if key not in curr_state_dict_keys and key.startswith('module.'):
+            key = key[7:]
+
+        if key in curr_state_dict_keys:
+            # Check shape compatibility
+            if value.shape == model.state_dict()[key].shape:
+                new_state_dict[key] = value
+                matched += 1
+            else:
+                unmatched.append(f"{key} (shape mismatch: {value.shape} vs {model.state_dict()[key].shape})")
+        else:
+            unmatched.append(key)
+
+    # Load weights
+    model.load_state_dict(new_state_dict, strict=False)
+
+    print(f"Loaded {matched}/{len(state_dict)} pretrained parameters")
+    if unmatched:
+        print(f"Unmatched keys ({len(unmatched)}):")
+        for k in unmatched[:10]:  # Show first 10
+            print(f"  - {k}")
+        if len(unmatched) > 10:
+            print(f"  ... and {len(unmatched) - 10} more")
+
+    return model
 
 
 class MedNeXtBackbone(Backbone):
     """
     MedNeXt backbone compatible with Detectron2's backbone interface.
-    Supports pretrained weight loading and freezing.
     """
 
     def __init__(
@@ -323,40 +502,36 @@ class MedNeXtBackbone(Backbone):
         super().__init__()
 
         in_channels = input_shape.channels
-        norm = cfg.MODEL.UNETENCODER.NORM
         base_channels = cfg.MODEL.UNETENCODER.BASE_CHANNELS
         num_layers = cfg.MODEL.UNETENCODER.NUM_LAYERS
-
-        # MedNeXt config from cfg
-        model_size = getattr(cfg.MODEL, 'MEDNEXT_SIZE', 'S')
-        kernel_size = getattr(cfg.MODEL, 'MEDNEXT_KERNEL_SIZE', 3)
         deep_supervision = cfg.MODEL.UNETENCODER.DEEP_SUPERVISION
 
-        # Get model config
-        model_cfg = MODEL_CONFIGS.get(model_size, MODEL_CONFIGS['S'])
+        # MedNeXt config
+        kernel_size = getattr(cfg.MODEL, 'MEDNEXT_KERNEL_SIZE', 3)
+        n_classes = 1  # Binary segmentation output
 
-        # Build MedNeXt encoder-decoder
+        # Build MedNeXt - exact parameters for MedNeXt-S kernel3
         self.mednext = MedNeXt(
             in_channels=in_channels,
             n_channels=base_channels,
-            n_classes=1,  # Will be overridden by segmentor head
-            exp_r=model_cfg['exp_r'],
+            n_classes=n_classes,
+            exp_r=2,
             kernel_size=kernel_size,
             deep_supervision=deep_supervision,
             do_res=True,
             do_res_up_down=True,
-            block_counts=model_cfg['block_counts'],
-            norm_type="group",
-            grn=False,
-            dim=3
+            block_counts=[2, 2, 2, 2, 2, 2, 2, 2, 2],
+            norm_type='group',
+            dim='3d',
+            grn=False
         )
 
-        # Setup output features
+        # Setup output features for detectron2
         self._out_features = []
         self._out_feature_channels = {}
         self._out_feature_strides = {}
 
-        # Feature names matching UNet backbone format
+        # Feature outputs at different scales
         for i in range(num_layers + 1):
             stride = 2 ** i
             name = f'feat_{stride}x'
@@ -365,11 +540,12 @@ class MedNeXtBackbone(Backbone):
             self._out_feature_strides[name] = stride
 
         self.return_seg_logits = 'seg' in cfg.MODEL.TASK
-        self.return_inter_feats = 'cline' in cfg.MODEL.TASK
+        self.deep_supervision = deep_supervision
+        self.n_channels = base_channels
 
         # Load pretrained weights if provided
-        if pretrained_path:
-            self.load_pretrained(pretrained_path)
+        if pretrained_path and pretrained_path.strip():
+            load_pretrained_mednext(self.mednext, pretrained_path)
 
         # Freeze backbone if requested
         if freeze_backbone:
@@ -377,57 +553,58 @@ class MedNeXtBackbone(Backbone):
 
     def forward(self, x: torch.Tensor) -> Dict[str, torch.Tensor]:
         """Forward pass returning multi-scale features."""
-        # Get MedNeXt stem output
+        # Get intermediate features manually
         x_stem = self.mednext.stem(x)
 
-        # Encoder stages
-        x0 = self.mednext.enc_block_0(x_stem)
-        x_down0 = self.mednext.down_0(x0)
+        # Encoder
+        x_res_0 = self.mednext.enc_block_0(x_stem)
+        x_down_0 = self.mednext.down_0(x_res_0)
 
-        x1 = self.mednext.enc_block_1(x_down0)
-        x_down1 = self.mednext.down_1(x1)
+        x_res_1 = self.mednext.enc_block_1(x_down_0)
+        x_down_1 = self.mednext.down_1(x_res_1)
 
-        x2 = self.mednext.enc_block_2(x_down1)
-        x_down2 = self.mednext.down_2(x2)
+        x_res_2 = self.mednext.enc_block_2(x_down_1)
+        x_down_2 = self.mednext.down_2(x_res_2)
 
-        x3 = self.mednext.enc_block_3(x_down2)
-        x_down3 = self.mednext.down_3(x3)
+        x_res_3 = self.mednext.enc_block_3(x_down_2)
+        x_down_3 = self.mednext.down_3(x_res_3)
 
         # Bottleneck
-        x_bottleneck = self.mednext.bottleneck(x_down3)
+        x_bottleneck = self.mednext.bottleneck(x_down_3)
 
         # Decoder with skip connections
-        d3 = self.mednext.up_3(x_bottleneck)
-        d3 = d3 + x3
+        x_up_3 = self.mednext.up_3(x_bottleneck)
+        d3 = x_res_3 + x_up_3
         d3 = self.mednext.dec_block_3(d3)
 
-        d2 = self.mednext.up_2(d3)
-        d2 = d2 + x2
+        x_up_2 = self.mednext.up_2(d3)
+        d2 = x_res_2 + x_up_2
         d2 = self.mednext.dec_block_2(d2)
 
-        d1 = self.mednext.up_1(d2)
-        d1 = d1 + x1
+        x_up_1 = self.mednext.up_1(d2)
+        d1 = x_res_1 + x_up_1
         d1 = self.mednext.dec_block_1(d1)
 
-        d0 = self.mednext.up_0(d1)
-        d0 = d0 + x0
+        x_up_0 = self.mednext.up_0(d1)
+        d0 = x_res_0 + x_up_0
         d0 = self.mednext.dec_block_0(d0)
 
-        # Build output dictionary matching UNet interface
+        # Build output dictionary
         outputs = {
-            'feat_16x': x_bottleneck,  # Bottleneck (deepest)
+            'feat_16x': x_bottleneck,
             'feat_8x': d3,
             'feat_4x': d2,
             'feat_2x': d1,
-            'feat_1x': d0,  # Full resolution
+            'feat_1x': d0,
         }
 
         if self.return_seg_logits:
-            outputs['seg'] = self.mednext.out_block(d0)
+            outputs['seg'] = self.mednext.out_0(d0)
 
         return outputs
 
     def output_shape(self):
+        from ..layers.conv_blocks import ShapeSpec3d
         return {
             name: ShapeSpec3d(
                 channels=self._out_feature_channels[name],
@@ -436,83 +613,13 @@ class MedNeXtBackbone(Backbone):
             for name in self._out_features
         }
 
-    def load_pretrained(self, pretrained_path: str):
-        """
-        Load pretrained weights from nnUNet format.
-
-        Args:
-            pretrained_path: Path to model_best.model or model_best.model.pkl
-        """
-        path = Path(pretrained_path)
-
-        if path.suffix == '.pkl':
-            # Load pickle file (contains model config)
-            with open(path, 'rb') as f:
-                checkpoint_info = pickle.load(f)
-            print(f"Loaded checkpoint info from {path}")
-            # The actual weights are in the .model file
-            model_path = path.with_suffix('')  # Remove .pkl
-            if model_path.exists():
-                pretrained_path = str(model_path)
-
-        # Load the model weights
-        print(f"Loading pretrained weights from {pretrained_path}")
-        checkpoint = torch.load(pretrained_path, map_location='cpu')
-
-        # Handle different checkpoint formats
-        if isinstance(checkpoint, dict):
-            if 'state_dict' in checkpoint:
-                state_dict = checkpoint['state_dict']
-            elif 'network_weights' in checkpoint:
-                state_dict = checkpoint['network_weights']
-            elif 'model' in checkpoint:
-                state_dict = checkpoint['model']
-            else:
-                state_dict = checkpoint
-        else:
-            state_dict = checkpoint
-
-        # Try to load weights with flexible key matching
-        model_state = self.mednext.state_dict()
-        matched_keys = []
-        unmatched_keys = []
-
-        for key in state_dict.keys():
-            # Try direct match
-            if key in model_state:
-                if state_dict[key].shape == model_state[key].shape:
-                    model_state[key] = state_dict[key]
-                    matched_keys.append(key)
-                else:
-                    unmatched_keys.append(f"{key} (shape mismatch)")
-            else:
-                # Try removing prefix
-                for prefix in ['module.', 'mednext.', 'encoder.', 'network.']:
-                    new_key = key.replace(prefix, '')
-                    if new_key in model_state:
-                        if state_dict[key].shape == model_state[new_key].shape:
-                            model_state[new_key] = state_dict[key]
-                            matched_keys.append(key)
-                            break
-                else:
-                    unmatched_keys.append(key)
-
-        self.mednext.load_state_dict(model_state, strict=False)
-
-        print(f"Loaded {len(matched_keys)} pretrained parameters")
-        if unmatched_keys:
-            print(f"Unmatched keys: {len(unmatched_keys)}")
-            if len(unmatched_keys) <= 10:
-                for k in unmatched_keys:
-                    print(f"  - {k}")
-
     def freeze_encoder(self):
-        """Freeze all encoder parameters (for transfer learning)."""
+        """Freeze all encoder parameters."""
         # Freeze stem
         for param in self.mednext.stem.parameters():
             param.requires_grad = False
 
-        # Freeze encoder blocks
+        # Freeze encoder blocks and downsampling
         encoder_modules = [
             self.mednext.enc_block_0, self.mednext.down_0,
             self.mednext.enc_block_1, self.mednext.down_1,
@@ -525,15 +632,10 @@ class MedNeXtBackbone(Backbone):
             for param in module.parameters():
                 param.requires_grad = False
 
-        print("Encoder frozen. Only decoder parameters will be trained.")
+        print("Encoder frozen. Only decoder will be trained.")
 
     def freeze(self, freeze_at: int = 0):
-        """
-        Freeze backbone up to a certain stage.
-
-        Args:
-            freeze_at: Stage to freeze up to (0 = no freezing)
-        """
+        """Freeze up to a certain stage."""
         if freeze_at >= 1:
             for param in self.mednext.stem.parameters():
                 param.requires_grad = False
@@ -562,7 +664,6 @@ class MedNeXtBackbone(Backbone):
         """Unfreeze all parameters."""
         for param in self.parameters():
             param.requires_grad = True
-        print("All parameters unfrozen.")
 
 
 @BACKBONE_REGISTRY.register()
@@ -570,26 +671,25 @@ def build_mednext_backbone(cfg, input_shape=None):
     """
     Build MedNeXt backbone.
 
-    Config options:
-        cfg.MODEL.MEDNEXT_SIZE: Model size ('S', 'B', 'M', 'L')
+    Config:
         cfg.MODEL.MEDNEXT_KERNEL_SIZE: Kernel size (3 or 5)
-        cfg.MODEL.BACKBONE.FREEZE_AT: Freeze stages (0 = no freeze)
         cfg.MODEL.BACKBONE.PRETRAINED: Path to pretrained weights
-        cfg.MODEL.BACKBONE.FREEZE_BACKBONE: Whether to freeze entire encoder
+        cfg.MODEL.BACKBONE.FREEZE_BACKBONE: Whether to freeze encoder
+        cfg.MODEL.BACKBONE.FREEZE_AT: Freeze stages (0 = no freeze)
     """
     from ..layers.conv_blocks import ShapeSpec3d
 
     if input_shape is None:
         input_shape = ShapeSpec3d(channels=1)
 
-    pretrained_path = getattr(cfg.MODEL.BACKBONE, 'PRETRAINED', None)
+    pretrained_path = getattr(cfg.MODEL.BACKBONE, 'PRETRAINED', '')
     freeze_backbone = getattr(cfg.MODEL.BACKBONE, 'FREEZE_BACKBONE', False)
     freeze_at = cfg.MODEL.BACKBONE.FREEZE_AT
 
     backbone = MedNeXtBackbone(
         cfg,
         input_shape,
-        pretrained_path=pretrained_path,
+        pretrained_path=pretrained_path if pretrained_path else None,
         freeze_backbone=freeze_backbone
     )
 
