@@ -304,6 +304,40 @@ class VesselClineDeformDatasetMapper:
         return dataset_dict
 
 
+class CenterCrop(Augmentation):
+    """
+    Center crop for inference - ensures test images don't exceed memory limits.
+    """
+
+    def __init__(self, crop_size):
+        """
+        Args:
+            crop_size: tuple of (H, W, D) - the size to crop to
+        """
+        super().__init__()
+        self._init(locals())
+
+    def get_transform(self, image, sem_seg=None):
+        h, w, d = image.shape[:3]
+        croph, cropw, cropd = self.crop_size
+
+        # If image is smaller than crop size, don't crop
+        if h <= croph and w <= cropw and d <= cropd:
+            return CropTransform(0, 0, 0, h, w, d)
+
+        # Center crop
+        h0 = max(0, (h - croph) // 2)
+        w0 = max(0, (w - cropw) // 2)
+        d0 = max(0, (d - cropd) // 2)
+
+        # Adjust crop size if image is smaller
+        croph = min(croph, h)
+        cropw = min(cropw, w)
+        cropd = min(cropd, d)
+
+        return CropTransform(h0, w0, d0, croph, cropw, cropd)
+
+
 def build_vessel_transform_gen(cfg, is_train):
     """Build transform generators for vessel segmentation."""
     tfm_gens = []
@@ -315,6 +349,8 @@ def build_vessel_transform_gen(cfg, is_train):
         tfm_gens.append(RandomFlip_X(prob=0.5))
         tfm_gens.append(RandomSwapAxesXZ())
     else:
-        # For inference, optionally apply center crop or use full volume
-        pass
+        # For inference, use larger crop to preserve context but limit memory
+        # Using 2x training crop size for better evaluation quality
+        test_crop_size = tuple(s * 2 for s in crop_size)  # e.g., (256, 256, 256)
+        tfm_gens.append(CenterCrop(test_crop_size))
     return tfm_gens
