@@ -147,8 +147,10 @@ def run_inference(cfg, model, data_loader, dataset_dicts, output_dir, device):
 
     # Create output directories
     seg_dir = os.path.join(output_dir, "segmentations")
+    gt_dir = os.path.join(output_dir, "ground_truth")
     cline_dir = os.path.join(output_dir, "centerlines")
     os.makedirs(seg_dir, exist_ok=True)
+    os.makedirs(gt_dir, exist_ok=True)
     os.makedirs(cline_dir, exist_ok=True)
 
     results = []
@@ -157,14 +159,21 @@ def run_inference(cfg, model, data_loader, dataset_dicts, output_dir, device):
 
     with torch.no_grad():
         for idx, inputs in enumerate(tqdm(data_loader, desc="Inference")):
-            # Get file_id from dataset_dicts
-            if idx < len(dataset_dicts):
-                file_id = dataset_dicts[idx].get("file_id", f"sample_{idx}")
-            else:
-                file_id = f"sample_{idx}"
+            # Get file_id from the actual input (more reliable than index-based lookup)
+            file_id = inputs[0].get("file_id", None)
+            if file_id is None:
+                # Fallback to dataset_dicts if file_id not in input
+                if idx < len(dataset_dicts):
+                    file_id = dataset_dicts[idx].get("file_id", f"sample_{idx}")
+                else:
+                    file_id = f"sample_{idx}"
 
             case_id = os.path.basename(file_id).replace('.npz', '')
-            logger.info(f"Processing: {case_id}")
+            logger.info(f"Processing: {case_id} (file_id: {file_id})")
+
+            # Debug: print input shapes
+            logger.info(f"  Input image shape: {inputs[0]['image'].shape}")
+            logger.info(f"  Input seg shape: {inputs[0]['seg'].shape}")
 
             try:
                 # Run inference - the model expects inputs as a list of dicts
@@ -179,11 +188,21 @@ def run_inference(cfg, model, data_loader, dataset_dicts, output_dir, device):
                 # Get ground truth from input
                 gt_seg = inputs[0].get("seg", None)
 
+                # Debug: print output shapes
+                if pred_seg is not None:
+                    logger.info(f"  Output seg shape: {pred_seg.shape}")
+                if gt_seg is not None:
+                    logger.info(f"  GT seg shape: {gt_seg.shape}")
+
                 # Compute dice score
                 dice_score = 0.0
                 if pred_seg is not None and gt_seg is not None:
                     pred_seg_np = pred_seg.cpu().numpy()
                     gt_seg_np = gt_seg.cpu().numpy()
+
+                    # Debug: print numpy shapes before processing
+                    logger.info(f"  pred_seg_np shape before: {pred_seg_np.shape}")
+                    logger.info(f"  gt_seg_np shape before: {gt_seg_np.shape}")
 
                     # Handle shape differences
                     if pred_seg_np.ndim == 4:
@@ -191,15 +210,36 @@ def run_inference(cfg, model, data_loader, dataset_dicts, output_dir, device):
                     if gt_seg_np.ndim == 4:
                         gt_seg_np = gt_seg_np[0]
 
+                    # Debug: print shapes after processing
+                    logger.info(f"  pred_seg_np shape after: {pred_seg_np.shape}")
+                    logger.info(f"  gt_seg_np shape after: {gt_seg_np.shape}")
+
+                    # Check if shapes match
+                    if pred_seg_np.shape != gt_seg_np.shape:
+                        logger.warning(f"  SHAPE MISMATCH! pred: {pred_seg_np.shape} vs gt: {gt_seg_np.shape}")
+                        # Try to match shapes by taking minimum dimensions
+                        min_shape = tuple(min(p, g) for p, g in zip(pred_seg_np.shape, gt_seg_np.shape))
+                        pred_seg_np = pred_seg_np[:min_shape[0], :min_shape[1], :min_shape[2]]
+                        gt_seg_np = gt_seg_np[:min_shape[0], :min_shape[1], :min_shape[2]]
+                        logger.info(f"  Adjusted to common shape: {min_shape}")
+
                     # Binarize
                     pred_binary = (pred_seg_np > 0.5).astype(np.float32)
                     gt_binary = (gt_seg_np > 0).astype(np.float32)
 
+                    # Debug: print sum of foreground voxels
+                    logger.info(f"  Pred foreground voxels: {pred_binary.sum()}")
+                    logger.info(f"  GT foreground voxels: {gt_binary.sum()}")
+
                     dice_score = compute_dice(pred_binary, gt_binary)
 
-                    # Save segmentation
-                    seg_path = os.path.join(seg_dir, f"{case_id}_seg.nii.gz")
+                    # Save prediction
+                    seg_path = os.path.join(seg_dir, f"{case_id}_pred.nii.gz")
                     save_segmentation(pred_seg_np, seg_path)
+
+                    # Also save ground truth for comparison
+                    gt_path = os.path.join(gt_dir, f"{case_id}_gt.nii.gz")
+                    save_segmentation(gt_binary, gt_path)
                 else:
                     seg_path = ""
                     logger.warning(f"No segmentation output for {case_id}")
@@ -211,11 +251,15 @@ def run_inference(cfg, model, data_loader, dataset_dicts, output_dir, device):
                     cline_path = os.path.join(cline_dir, f"{case_id}_cline.npy")
                     save_centerline(pred_verts_np, cline_path)
 
+                # Define gt_path at this scope level
+                gt_path_result = gt_path if pred_seg is not None and gt_seg is not None else ""
+
                 results.append({
                     "case_id": case_id,
                     "file_id": file_id,
                     "dice": dice_score,
                     "seg_path": seg_path,
+                    "gt_path": gt_path_result,
                     "cline_path": cline_path,
                 })
 
@@ -243,7 +287,7 @@ def save_results(results, output_dir):
     """Save results to CSV file and print summary."""
     results_path = os.path.join(output_dir, "results.csv")
     with open(results_path, 'w', newline='') as f:
-        fieldnames = ["case_id", "file_id", "dice", "seg_path", "cline_path", "error"]
+        fieldnames = ["case_id", "file_id", "dice", "seg_path", "gt_path", "cline_path", "error"]
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
         for r in results:
@@ -270,7 +314,8 @@ def save_results(results, output_dir):
 
     logger.info("-"*60)
     logger.info(f"Results saved to: {results_path}")
-    logger.info(f"Segmentations saved to: {os.path.join(output_dir, 'segmentations')}")
+    logger.info(f"Predictions saved to: {os.path.join(output_dir, 'segmentations')}")
+    logger.info(f"Ground truth saved to: {os.path.join(output_dir, 'ground_truth')}")
     logger.info(f"Centerlines saved to: {os.path.join(output_dir, 'centerlines')}")
     logger.info("="*60)
 
