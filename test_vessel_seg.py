@@ -76,8 +76,29 @@ def get_test_samples_from_csv(dataset_dicts, csv_path, subset='test'):
     return filtered_dicts
 
 
-def save_nifti(array, output_path, affine=None):
-    """Save array as NIfTI file."""
+def save_nifti(array, output_path, spacing=None, origin=None, direction=None):
+    """
+    Save array as NIfTI file using SimpleITK for proper spatial info.
+    SimpleITK arrays are in (Z, Y, X) order.
+    """
+    import SimpleITK as sitk
+
+    # Create SimpleITK image
+    sitk_img = sitk.GetImageFromArray(array.astype(np.float32))
+
+    # Set spatial information if available
+    if spacing is not None:
+        sitk_img.SetSpacing(tuple(float(s) for s in spacing))
+    if origin is not None:
+        sitk_img.SetOrigin(tuple(float(o) for o in origin))
+    if direction is not None:
+        sitk_img.SetDirection(tuple(float(d) for d in direction))
+
+    sitk.WriteImage(sitk_img, output_path)
+
+
+def save_nifti_nibabel(array, output_path, affine=None):
+    """Save array as NIfTI file using nibabel (fallback)."""
     if affine is None:
         affine = np.eye(4)
     nii_img = nib.Nifti1Image(array.astype(np.float32), affine)
@@ -193,11 +214,20 @@ class InferenceDataMapper:
         dataset_dict["cline"] = torch.as_tensor(np.ascontiguousarray(cline_aug[None, ...]))
         dataset_dict["seg"] = torch.as_tensor(np.ascontiguousarray(seg_aug[None, ...]))
 
-        # Also store original ground truth for comparison
-        if self.class_id > 0:
-            seg_original[seg_original != self.class_id] = 0
-        dataset_dict["seg_original"] = seg_original
+        # Store UNMODIFIED original ground truth for comparison
+        # Don't filter by class_id here - save raw data from NPZ
+        dataset_dict["seg_original_raw"] = npz_file["seg"].copy()  # Completely raw
+        dataset_dict["seg_original"] = seg_original  # After class filtering
         dataset_dict["seg_roi"] = seg_roi  # Cropped but before CenterCrop
+        dataset_dict["npz_path"] = dataset_dict["file_name"]  # Store path for debug
+
+        # Store spatial information from NPZ for proper NIfTI saving
+        if "spacing" in npz_file:
+            dataset_dict["spacing"] = npz_file["spacing"]
+        if "origin" in npz_file:
+            dataset_dict["origin"] = npz_file["origin"]
+        if "direction" in npz_file:
+            dataset_dict["direction"] = npz_file["direction"]
 
         return dataset_dict
 
@@ -312,9 +342,19 @@ def run_inference(cfg, model, dataset_dicts, output_dir, device):
                     logger.info(f"  Full pred shape: {full_pred.shape}")
                     logger.info(f"  Full pred foreground voxels: {full_pred.sum()}")
 
-                    # Get original ground truth
-                    gt_original = data["seg_original"]
-                    gt_binary = (gt_original > 0).astype(np.float32)
+                    # Get original ground truth - use RAW (unfiltered) data
+                    gt_raw = data["seg_original_raw"]
+                    gt_filtered = data["seg_original"]
+
+                    # Debug: show what's in the data
+                    logger.info(f"  NPZ path: {data['npz_path']}")
+                    logger.info(f"  GT raw unique values: {np.unique(gt_raw)}")
+                    logger.info(f"  GT raw shape: {gt_raw.shape}")
+                    logger.info(f"  GT raw foreground (>0): {(gt_raw > 0).sum()}")
+                    logger.info(f"  GT filtered (class_id={cfg.MODEL.PRED_CLASS}) foreground: {(gt_filtered > 0).sum()}")
+
+                    # Use RAW ground truth for saving (to match /raid)
+                    gt_binary = (gt_raw > 0).astype(np.float32)
                     logger.info(f"  Original GT foreground voxels: {gt_binary.sum()}")
 
                     # Compute Dice on FULL volume
@@ -334,13 +374,20 @@ def run_inference(cfg, model, dataset_dicts, output_dir, device):
                     dice_cropped = compute_dice(pred_crop, gt_crop)
                     logger.info(f"  Dice (cropped): {dice_cropped:.4f}")
 
-                    # Save prediction in ORIGINAL coordinates
-                    seg_path = os.path.join(seg_dir, f"{case_id}_pred.nii.gz")
-                    save_nifti(full_pred, seg_path)
+                    # Get spatial info from NPZ
+                    spacing = data.get("spacing", None)
+                    origin = data.get("origin", None)
+                    direction = data.get("direction", None)
 
-                    # Save original ground truth for comparison
+                    logger.info(f"  Spatial info - spacing: {spacing}, origin: {origin}")
+
+                    # Save prediction in ORIGINAL coordinates with proper spatial info
+                    seg_path = os.path.join(seg_dir, f"{case_id}_pred.nii.gz")
+                    save_nifti(full_pred, seg_path, spacing, origin, direction)
+
+                    # Save original ground truth for comparison (should match /raid exactly)
                     gt_path = os.path.join(gt_dir, f"{case_id}_gt.nii.gz")
-                    save_nifti(gt_binary, gt_path)
+                    save_nifti(gt_binary, gt_path, spacing, origin, direction)
 
                     results.append({
                         "case_id": case_id,
