@@ -83,10 +83,10 @@ INPUT:
     GAMMA_RANGE: (0.7, 1.3)
 
 SOLVER:
-  # Reduced batch size due to large model
-  IMS_PER_BATCH: 2  # 1 per GPU with gradient accumulation recommended
+  # Model only supports batch size 1 due to cline_deform implementation
+  IMS_PER_BATCH: 1
   # Learning rate tuned for large model
-  BASE_LR: 2e-4  # Lower LR for larger model
+  BASE_LR: 1e-4  # Lower LR for larger model with batch size 1
   WEIGHT_DECAY: 1e-5  # Reduced weight decay
   WARMUP_ITERS: 1000  # More warmup for larger model
   WARMUP_FACTOR: 0.01
