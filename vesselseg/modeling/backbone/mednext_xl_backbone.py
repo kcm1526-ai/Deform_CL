@@ -429,11 +429,13 @@ class MedNeXtXL(nn.Module):
 
         # ============ DECODER ============
         # Attention gates for skip connections
+        # Gate signal comes from decoder (after upsampling), skip from encoder
+        # Both should have same channels at each level
         if use_attention_gates:
-            self.attn_gate_3 = AttentionGate3D(16 * n_channels, 8 * n_channels)
-            self.attn_gate_2 = AttentionGate3D(8 * n_channels, 4 * n_channels)
-            self.attn_gate_1 = AttentionGate3D(4 * n_channels, 2 * n_channels)
-            self.attn_gate_0 = AttentionGate3D(2 * n_channels, n_channels)
+            self.attn_gate_3 = AttentionGate3D(8 * n_channels, 8 * n_channels)
+            self.attn_gate_2 = AttentionGate3D(4 * n_channels, 4 * n_channels)
+            self.attn_gate_1 = AttentionGate3D(2 * n_channels, 2 * n_channels)
+            self.attn_gate_0 = AttentionGate3D(n_channels, n_channels)
 
         # Up Stage 3
         self.up_3 = MedNeXtUpBlockXL(
