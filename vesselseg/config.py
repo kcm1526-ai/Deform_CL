@@ -25,8 +25,13 @@ def add_seg3d_config(cfg):
     cfg.MODEL.LOSS = 'dice'
 
     # MedNeXt backbone configuration
-    cfg.MODEL.MEDNEXT_SIZE = "S"  # Model size: 'S', 'B', 'M', 'L'
-    cfg.MODEL.MEDNEXT_KERNEL_SIZE = 3  # Kernel size: 3 or 5
+    cfg.MODEL.MEDNEXT_SIZE = "S"  # Model size: 'S', 'B', 'M', 'L', 'XL'
+    cfg.MODEL.MEDNEXT_KERNEL_SIZE = 3  # Kernel size: 3, 5, or 7
+    # MedNeXt-XL specific options
+    cfg.MODEL.USE_ATTENTION_GATES = False  # Attention gates at skip connections
+    cfg.MODEL.USE_SELF_ATTENTION = False   # Self-attention at bottleneck
+    cfg.MODEL.USE_EDGE_ENHANCEMENT = False # Edge enhancement module
+    cfg.MODEL.USE_VESSEL_ATTENTION = False # Vessel-specific attention
 
     cfg.MODEL.UNETENCODER = CN()
     cfg.MODEL.UNETENCODER.BASE_CHANNELS = 16
