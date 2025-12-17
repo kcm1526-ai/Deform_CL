@@ -533,14 +533,14 @@ class MedNeXtXL(nn.Module):
     def _checkpoint_forward(self, module, x):
         """Forward with gradient checkpointing."""
         if self.use_checkpointing and self.training:
-            return checkpoint.checkpoint(module, x, self.dummy_tensor, use_reentrant=False)
+            return checkpoint.checkpoint(module, x, self.dummy_tensor)
         return module(x)
 
     def _checkpoint_sequential(self, sequential, x):
         """Forward through sequential with checkpointing."""
         if self.use_checkpointing and self.training:
             for layer in sequential:
-                x = checkpoint.checkpoint(layer, x, self.dummy_tensor, use_reentrant=False)
+                x = checkpoint.checkpoint(layer, x, self.dummy_tensor)
             return x
         return sequential(x)
 
