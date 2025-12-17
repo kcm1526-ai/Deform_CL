@@ -436,7 +436,28 @@ def main(args):
 
 
 if __name__ == "__main__":
-    args = default_argument_parser().parse_args()
+    import os
+    parser = default_argument_parser()
+    parser.add_argument(
+        "--gpus",
+        type=str,
+        default=None,
+        help="Comma-separated list of GPU IDs to use (e.g., '2,3,4,5'). "
+             "If not specified, uses all available GPUs."
+    )
+    args = parser.parse_args()
+
+    # Set CUDA_VISIBLE_DEVICES if --gpus is specified
+    if args.gpus is not None:
+        os.environ["CUDA_VISIBLE_DEVICES"] = args.gpus
+        print(f"Using GPUs: {args.gpus}")
+        # Update num_gpus to match the number of specified GPUs
+        specified_gpus = len(args.gpus.split(","))
+        if args.num_gpus > specified_gpus:
+            print(f"Warning: --num-gpus ({args.num_gpus}) > specified GPUs ({specified_gpus}). "
+                  f"Using {specified_gpus} GPUs.")
+            args.num_gpus = specified_gpus
+
     print("=" * 60)
     print("Vessel Segmentation Training with DeformCL")
     print("=" * 60)
