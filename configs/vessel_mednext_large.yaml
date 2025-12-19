@@ -1,9 +1,10 @@
-# Configuration for Lung Vessel Segmentation with MedNeXt-XL Backbone
-# MedNeXt-XL: Extra Large MedNeXt with Full Attention (~400M parameters)
+# Configuration for Lung Vessel Segmentation with MedNeXt-Large Backbone
+# MedNeXt-L: Large MedNeXt with Full Attention (~100M parameters)
+# Memory-efficient version that fits on 32GB GPUs
 #
 # Key Features:
-# - 96 base channels (3x MedNeXt-S)
-# - [3, 4, 12, 12, 12, 12, 12, 4, 3] block counts
+# - 48 base channels (1.5x MedNeXt-S)
+# - [3, 4, 8, 8, 8, 8, 8, 4, 3] block counts (reduced from XL)
 # - SE attention in every block
 # - Attention gates at skip connections
 # - Self-attention at bottleneck
@@ -12,7 +13,7 @@
 # - Deep supervision
 # - Gradient checkpointing for memory efficiency
 #
-# Target: Dice > 0.88 for lung vessel segmentation
+# Target: Dice > 0.85 for lung vessel segmentation
 
 MODEL:
   META_ARCHITECTURE: "ClineDeformModel"
@@ -21,20 +22,20 @@ MODEL:
   TASK: ['cline', 'seg']
   PRED_CLASS: 1
   BACKBONE:
-    NAME: "build_mednext_xl_backbone"  # MedNeXt-XL backbone
+    NAME: "build_mednext_xl_backbone"  # Uses same backbone class
     FREEZE_AT: 0
     PRETRAINED: ""
     FREEZE_BACKBONE: False
-  # MedNeXt-XL specific settings
-  MEDNEXT_SIZE: "XL"  # Extra Large
-  MEDNEXT_KERNEL_SIZE: 7  # Large kernel for better context
-  # XL attention options
+  # MedNeXt-L specific settings
+  MEDNEXT_SIZE: "L"  # Large (not XL)
+  MEDNEXT_KERNEL_SIZE: 5  # Reduced from 7 for memory
+  # Attention options
   USE_ATTENTION_GATES: True  # Attention gates at skip connections
   USE_SELF_ATTENTION: True   # Self-attention at bottleneck
   USE_EDGE_ENHANCEMENT: True # Edge enhancement module
   USE_VESSEL_ATTENTION: True # Vessel-specific attention
   UNETENCODER:
-    BASE_CHANNELS: 96  # 3x MedNeXt-S (32 -> 96)
+    BASE_CHANNELS: 48  # Reduced from 96 (saves ~4x memory)
     NUM_LAYERS: 4
     NORM: 'SyncBN'
     DEEP_SUPERVISION: True
@@ -50,17 +51,17 @@ MODEL:
     LOWER_THRES: 20
     PTS_NUM: 500
     USE_LOCAL_CHAMFER: True
-  # Thin vessel loss with increased importance for XL model
+  # Thin vessel loss
   THIN_VESSEL_LOSS:
     ENABLED: True
     DICE_WEIGHT: 0.25
-    CLDICE_WEIGHT: 0.40  # Increased for better vessel continuity
+    CLDICE_WEIGHT: 0.40
     FOCAL_WEIGHT: 0.15
     BOUNDARY_WEIGHT: 0.10
     MULTISCALE_WEIGHT: 0.10
     CLDICE_ALPHA: 0.6
     FOCAL_GAMMA: 2.5
-    DEEP_SUPERVISION_WEIGHT: 0.4  # Increased for deeper model
+    DEEP_SUPERVISION_WEIGHT: 0.4
 
 DATASETS:
   TRAIN: ("VesselSeg",)
@@ -84,16 +85,14 @@ INPUT:
 
 SOLVER:
   # IMS_PER_BATCH = total batch size across all GPUs
-  # Model supports batch size 1 per GPU, so set this to num_gpus
   # For 4 GPUs: IMS_PER_BATCH = 4 (1 per GPU)
   IMS_PER_BATCH: 4
-  # Learning rate tuned for large model
-  BASE_LR: 4e-4  # Scale LR with batch size (1e-4 * 4)
-  WEIGHT_DECAY: 1e-5  # Reduced weight decay
-  WARMUP_ITERS: 1000  # More warmup for larger model
+  BASE_LR: 4e-4
+  WEIGHT_DECAY: 1e-5
+  WARMUP_ITERS: 1000
   WARMUP_FACTOR: 0.01
   LR_SCHEDULER_NAME: "WarmupCosineLR"
-  MAX_ITER: 40000  # More iterations for larger model
+  MAX_ITER: 40000
   CHECKPOINT_PERIOD: 4000
   CLIP_GRADIENTS:
     ENABLED: True
@@ -106,6 +105,6 @@ SOLVER:
 TEST:
   EVAL_PERIOD: 4000
 
-OUTPUT_DIR: "./outputs/vessel_mednext_xl"
+OUTPUT_DIR: "./outputs/vessel_mednext_large"
 
 CUDNN_BENCHMARK: False
