@@ -1,0 +1,109 @@
+# Configuration for Lung Vessel Segmentation with MedNeXt-Medium Backbone
+# MedNeXt-M: Medium MedNeXt with Attention (~40M parameters)
+# Memory-efficient version that fits on 32GB GPUs with multi-GPU training
+#
+# Key Features:
+# - 32 base channels (same as MedNeXt-S)
+# - [2, 3, 6, 6, 6, 6, 6, 3, 2] block counts
+# - SE attention in every block
+# - Attention gates at skip connections
+# - NO self-attention at bottleneck (saves significant memory)
+# - Vessel-specific attention
+# - Edge enhancement module
+# - Deep supervision
+# - Gradient checkpointing for memory efficiency
+#
+# Target: Dice > 0.82 for lung vessel segmentation
+
+MODEL:
+  META_ARCHITECTURE: "ClineDeformModel"
+  OUT_CHANNELS: (48,)
+  OUT_TASKS: ["features"]
+  TASK: ['cline', 'seg']
+  PRED_CLASS: 1
+  BACKBONE:
+    NAME: "build_mednext_xl_backbone"
+    FREEZE_AT: 0
+    PRETRAINED: ""
+    FREEZE_BACKBONE: False
+  # MedNeXt-M specific settings
+  MEDNEXT_SIZE: "M"
+  MEDNEXT_KERNEL_SIZE: 5  # Smaller kernel for memory
+  # Attention options - disable self-attention to save memory
+  USE_ATTENTION_GATES: True   # Keep attention gates
+  USE_SELF_ATTENTION: False   # DISABLED - saves ~4GB per GPU
+  USE_EDGE_ENHANCEMENT: True  # Keep edge enhancement
+  USE_VESSEL_ATTENTION: True  # Keep vessel attention
+  UNETENCODER:
+    BASE_CHANNELS: 32  # Same as MedNeXt-S
+    NUM_LAYERS: 4
+    NORM: 'SyncBN'
+    DEEP_SUPERVISION: True
+    USE_ATTENTION_GATES: True
+    USE_SE: True
+  DEFORM:
+    NUM_STEPS: 4
+    NORM: 'SyncBN'
+    LOSS_EDGE_WEIGHT: 0.5
+    SDF_LOSS_WEIGHT: 0.5
+    CHAMFER_LOSS_WEIGHT: 1.5
+    ADPTPL: True
+    LOWER_THRES: 20
+    PTS_NUM: 500
+    USE_LOCAL_CHAMFER: True
+  # Thin vessel loss
+  THIN_VESSEL_LOSS:
+    ENABLED: True
+    DICE_WEIGHT: 0.25
+    CLDICE_WEIGHT: 0.40
+    FOCAL_WEIGHT: 0.15
+    BOUNDARY_WEIGHT: 0.10
+    MULTISCALE_WEIGHT: 0.10
+    CLDICE_ALPHA: 0.6
+    FOCAL_GAMMA: 2.5
+    DEEP_SUPERVISION_WEIGHT: 0.4
+
+DATASETS:
+  TRAIN: ("VesselSeg",)
+  TEST: ("VesselSeg",)
+  NUM_FOLDS: 5
+  TEST_FOLDS: (0,)
+  SPLIT_CSV: ""
+
+DATALOADER:
+  NUM_WORKERS: 4
+
+INPUT:
+  CROP_SIZE_TRAIN: (128, 128, 128)
+  AUGMENTATION:
+    ELASTIC_DEFORM: True
+    ELASTIC_ALPHA: 80.0
+    ELASTIC_SIGMA: 8.0
+    INTENSITY_SHIFT: 0.15
+    INTENSITY_SCALE: 0.15
+    GAMMA_RANGE: (0.7, 1.3)
+
+SOLVER:
+  # For 4 GPUs: IMS_PER_BATCH = 4 (1 per GPU)
+  IMS_PER_BATCH: 4
+  BASE_LR: 4e-4
+  WEIGHT_DECAY: 1e-5
+  WARMUP_ITERS: 1000
+  WARMUP_FACTOR: 0.01
+  LR_SCHEDULER_NAME: "WarmupCosineLR"
+  MAX_ITER: 40000
+  CHECKPOINT_PERIOD: 4000
+  CLIP_GRADIENTS:
+    ENABLED: True
+    CLIP_TYPE: "full_model"
+    CLIP_VALUE: 0.5
+    NORM_TYPE: 2.0
+  BACKBONE_MULTIPLIER: 1.0
+  OPTIMIZER: "ADAMW"
+
+TEST:
+  EVAL_PERIOD: 4000
+
+OUTPUT_DIR: "./outputs/vessel_mednext_medium"
+
+CUDNN_BENCHMARK: False

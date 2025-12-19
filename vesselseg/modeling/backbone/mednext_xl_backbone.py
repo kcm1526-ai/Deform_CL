@@ -661,7 +661,21 @@ class MedNeXtXLBackbone(Backbone):
         use_edge_enhancement = getattr(cfg.MODEL, 'USE_EDGE_ENHANCEMENT', True)
         use_vessel_attention = getattr(cfg.MODEL, 'USE_VESSEL_ATTENTION', True)
 
-        # Build MedNeXt-XL
+        # Choose block counts based on base_channels for memory efficiency
+        # XL (96 channels): deepest, ~400M params
+        # L (48 channels): deep, ~100M params
+        # M (32 channels): moderate, ~40M params
+        # S (16-24 channels): shallow, ~15M params
+        if base_channels >= 96:
+            block_counts = [3, 4, 12, 12, 12, 12, 12, 4, 3]  # XL
+        elif base_channels >= 48:
+            block_counts = [2, 3, 8, 8, 8, 8, 8, 3, 2]  # L
+        elif base_channels >= 32:
+            block_counts = [2, 2, 4, 4, 4, 4, 4, 2, 2]  # M
+        else:
+            block_counts = [2, 2, 2, 2, 2, 2, 2, 2, 2]  # S
+
+        # Build MedNeXt model
         self.mednext = MedNeXtXL(
             in_channels=in_channels,
             n_channels=base_channels,
@@ -669,7 +683,7 @@ class MedNeXtXLBackbone(Backbone):
             exp_r=4,
             kernel_size=kernel_size,
             deep_supervision=deep_supervision,
-            block_counts=[3, 4, 12, 12, 12, 12, 12, 4, 3],
+            block_counts=block_counts,
             use_attention_gates=use_attention_gates,
             use_self_attention=use_self_attention,
             use_edge_enhancement=use_edge_enhancement,
