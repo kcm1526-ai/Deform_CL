@@ -234,6 +234,11 @@ class VesselTrainer(DefaultTrainer):
         # Wrap model in DDP with find_unused_parameters=True
         model = create_ddp_model(model, broadcast_buffers=False)
 
+        # Enable static graph for gradient checkpointing compatibility with DDP
+        # This is needed when using torch.utils.checkpoint with DDP
+        if hasattr(model, '_set_static_graph'):
+            model._set_static_graph()
+
         # Create trainer (SimpleTrainer or AMPTrainer)
         # Note: detectron2's default uses SimpleTrainer. If AMP is needed, use AMPTrainer.
         self._trainer = SimpleTrainer(model, data_loader, optimizer)
